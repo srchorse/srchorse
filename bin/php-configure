@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
+php_src_dir="${repo_root}/php-src"
+
+dry_run=0
+
+core_count() {
+	local cpus
+
+	if cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+		printf '%s\n' "$cpus"
+		return 0
+	fi
+
+	if command -v nproc >/dev/null 2>&1; then
+		cpus="$(nproc 2>/dev/null || true)"
+		if [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+			printf '%s\n' "$cpus"
+			return 0
+		fi
+	fi
+
+	printf '1\n'
+}
+
+ensure_parallel_makeflags() {
+	local jobs="$1"
+	local makeflags="${MAKEFLAGS:-}"
+
+	case " ${makeflags} " in
+		*" -j "*|*" -j${jobs} "*|*" --jobs "*|*" --jobs=${jobs} "*) ;;
+		*)
+			makeflags="${makeflags:+${makeflags} }-j${jobs}"
+			;;
+	esac
+
+	export MAKEFLAGS="${makeflags}"
+}
+
+jobs="$(core_count)"
+
+raw_modules=(
+	apcu
+	ast
+	bcmath
+	bz2
+	cli
+	common
+	curl
+	decimal
+	dev
+	fpm
+	gd
+	grpc
+	http
+	igbinary
+	imap
+	intl
+	mbstring
+	memcached
+	mysql
+	oauth
+	opcache
+	pgsql
+	protobuf
+	ps
+	pspell
+	psr
+	readline
+	redis
+	smbclient
+	soap
+	solr
+	sqlite3
+	ssh2
+	tidy
+	uploadprogress
+	uuid
+	xdebug
+	xlswriter
+	xml
+	xmlrpc
+	xsl
+	yaml
+	zip
+)
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} [--dry-run] [extra ./configure args...]
+
+Uses the hardcoded PHP module set defined in this script.
+
+Configures:
+  ${php_src_dir}
+
+Always enables ZTS:
+  --enable-zts
+
+Any extra arguments are passed through to ./configure.
+
+The script also exports MAKEFLAGS to use all detected CPU cores:
+  -j${jobs}
+EOF
+}
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+if [[ $# -gt 0 && "$1" == "--help" ]]; then
+	usage
+	exit 0
+fi
+
+extra_args=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--dry-run)
+			dry_run=1
+			;;
+		--help)
+			usage
+			exit 0
+			;;
+		*)
+			extra_args+=("$1")
+			;;
+	esac
+	shift
+done
+
+[[ -d "${php_src_dir}" ]] || die "missing ${php_src_dir}; run bin/source-clone first"
+ensure_parallel_makeflags "${jobs}"
+
+[[ ${#raw_modules[@]} -gt 0 ]] || die "no hardcoded PHP modules configured in ${0##*/}"
+
+declare -A seen_modules=()
+declare -a modules=()
+for module in "${raw_modules[@]}"; do
+	if [[ -z "${seen_modules[$module]:-}" ]]; then
+		seen_modules["$module"]=1
+		modules+=("$module")
+	fi
+done
+
+declare -A seen_flags=()
+declare -A seen_system_packages=()
+declare -a configure_flags=()
+declare -a missing_dependencies=()
+declare -a missing_system_packages=()
+declare -a notes=()
+declare -a skipped=()
+
+add_flag() {
+	local flag="$1"
+	if [[ -z "${seen_flags[$flag]:-}" ]]; then
+		seen_flags["$flag"]=1
+		configure_flags+=("$flag")
+	fi
+}
+
+add_note() {
+	notes+=("$1")
+}
+
+add_system_package() {
+	local package="$1"
+	if [[ -n "$package" && -z "${seen_system_packages[$package]:-}" ]]; then
+		seen_system_packages["$package"]=1
+		missing_system_packages+=("$package")
+	fi
+}
+
+add_missing_dependency() {
+	local message="$1"
+	local package="${2:-}"
+	missing_dependencies+=("$message")
+	add_system_package "$package"
+}
+
+skip_module() {
+	skipped+=("$1")
+}
+
+has_module() {
+	local module="$1"
+	[[ -n "${seen_modules[$module]:-}" ]]
+}
+
+require_command() {
+	local command_name="$1"
+	local package_hint="$2"
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		add_missing_dependency "missing command '$command_name'" "$package_hint"
+	fi
+}
+
+require_pkg_config_module() {
+	local feature="$1"
+	local module_name="$2"
+	local package_hint="$3"
+	if ! pkg-config --exists "$module_name"; then
+		add_missing_dependency "${feature}: missing pkg-config module '$module_name'" "$package_hint"
+	fi
+}
+
+require_any_file() {
+	local feature="$1"
+	local package_hint="$2"
+	shift 2
+	local path
+	for path in "$@"; do
+		if [[ -f "$path" ]]; then
+			return 0
+		fi
+	done
+	add_missing_dependency "${feature}: missing required header or library files" "$package_hint"
+}
+
+add_flag "--enable-zts"
+
+for module in "${modules[@]}"; do
+	case "${module}" in
+		bcmath)
+			add_flag "--enable-bcmath"
+			;;
+		bz2)
+			add_flag "--with-bz2"
+			;;
+		cli)
+			add_flag "--enable-cli"
+			;;
+		common|dev)
+			add_note "${module}: distro packaging meta-package; no php-src configure flag"
+			;;
+		curl)
+			add_flag "--with-curl"
+			;;
+		fpm)
+			add_flag "--enable-fpm"
+			;;
+		gd)
+			add_flag "--enable-gd"
+			;;
+		intl)
+			add_flag "--enable-intl"
+			;;
+		mbstring)
+			add_flag "--enable-mbstring"
+			;;
+		mysql)
+			add_flag "--enable-pdo"
+			add_flag "--enable-mysqlnd"
+			add_flag "--with-mysqli"
+			add_flag "--with-pdo-mysql"
+			;;
+		opcache)
+			add_note "opcache: bundled in php-src without a standard --enable-opcache switch; relying on default configure behavior"
+			;;
+		pgsql)
+			add_flag "--enable-pdo"
+			add_flag "--with-pgsql"
+			add_flag "--with-pdo-pgsql"
+			;;
+		readline)
+			add_flag "--with-readline"
+			;;
+		soap)
+			add_flag "--enable-soap"
+			;;
+		sqlite3)
+			add_flag "--enable-pdo"
+			add_flag "--with-sqlite3"
+			add_flag "--with-pdo-sqlite"
+			;;
+		tidy)
+			add_flag "--with-tidy"
+			;;
+		xml)
+			add_flag "--enable-xml"
+			add_flag "--enable-dom"
+			add_flag "--enable-simplexml"
+			add_flag "--enable-xmlreader"
+			add_flag "--enable-xmlwriter"
+			;;
+		xsl)
+			add_flag "--with-xsl"
+			;;
+		zip)
+			add_flag "--with-zip"
+			;;
+		apcu|ast|decimal|grpc|http|igbinary|imap|memcached|oauth|protobuf|ps|pspell|psr|redis|smbclient|solr|ssh2|uploadprogress|uuid|xdebug|xlswriter|xmlrpc|yaml)
+			skip_module "${module}"
+			;;
+		*)
+			skip_module "${module}"
+			;;
+	esac
+done
+
+require_command "pkg-config" "pkg-config"
+
+if [[ ! -x "${php_src_dir}/configure" ]]; then
+	require_command "autoconf" "autoconf"
+	require_command "bison" "bison"
+	require_command "re2c" "re2c"
+fi
+
+if has_module "curl"; then
+	require_pkg_config_module "curl" "libcurl" "libcurl4-openssl-dev"
+fi
+
+if has_module "gd"; then
+	require_pkg_config_module "gd" "libpng" "libpng-dev"
+fi
+
+if has_module "intl"; then
+	require_pkg_config_module "intl" "icu-uc" "libicu-dev"
+fi
+
+if has_module "mbstring"; then
+	require_pkg_config_module "mbstring" "oniguruma" "libonig-dev"
+fi
+
+if has_module "pgsql"; then
+	if ! command -v pg_config >/dev/null 2>&1 && ! pkg-config --exists libpq; then
+		add_missing_dependency "pgsql: missing PostgreSQL client development files" "libpq-dev"
+	fi
+fi
+
+if has_module "readline"; then
+	require_any_file "readline" "libreadline-dev" \
+		/usr/include/readline/readline.h \
+		/usr/local/include/readline/readline.h
+fi
+
+if has_module "sqlite3"; then
+	require_pkg_config_module "sqlite3" "sqlite3" "libsqlite3-dev"
+fi
+
+if has_module "tidy"; then
+	require_any_file "tidy" "libtidy-dev" \
+		/usr/include/tidy.h \
+		/usr/include/tidy/tidy.h \
+		/usr/include/tidyp.h \
+		/usr/include/tidyp/tidyp.h \
+		/usr/local/include/tidy.h \
+		/usr/local/include/tidy/tidy.h \
+		/usr/local/include/tidyp.h \
+		/usr/local/include/tidyp/tidyp.h
+fi
+
+if has_module "xml"; then
+	require_pkg_config_module "xml" "libxml-2.0" "libxml2-dev"
+fi
+
+if has_module "xsl"; then
+	require_pkg_config_module "xsl" "libxslt" "libxslt1-dev"
+fi
+
+if has_module "zip"; then
+	require_pkg_config_module "zip" "libzip" "libzip-dev"
+fi
+
+if [[ ${#missing_dependencies[@]} -gt 0 ]]; then
+	echo "==> php-src configure target: ${php_src_dir}"
+	echo "==> requested modules: ${modules[*]}"
+	echo "==> missing system dependencies:"
+	local_missing=""
+	for local_missing in "${missing_dependencies[@]}"; do
+		echo " - ${local_missing}"
+	done
+	if [[ ${#missing_system_packages[@]} -gt 0 ]]; then
+		printf '==> install on Debian/Ubuntu with: apt-get install -y'
+		for local_missing in "${missing_system_packages[@]}"; do
+			printf ' %q' "${local_missing}"
+		done
+		printf '\n'
+	fi
+	exit 1
+fi
+
+if [[ ! -x "${php_src_dir}/configure" ]]; then
+	if [[ ${dry_run} -eq 1 ]]; then
+		echo "==> php-src/configure is missing; dry run would execute ./buildconf --force first"
+	else
+		echo "==> php-src/configure is missing; running buildconf --force"
+		(
+			cd "${php_src_dir}"
+			./buildconf --force
+		)
+	fi
+fi
+
+declare -a cmd=("./configure")
+cmd+=("${configure_flags[@]}")
+cmd+=("${extra_args[@]}")
+
+echo "==> php-src configure target: ${php_src_dir}"
+echo "==> parallel jobs: ${jobs}"
+echo "==> requested modules: ${modules[*]}"
+if [[ ${#skipped[@]} -gt 0 ]]; then
+	echo "==> skipped modules not bundled in this php-src tree: ${skipped[*]}"
+fi
+if [[ ${#notes[@]} -gt 0 ]]; then
+	echo "==> notes:"
+	for note in "${notes[@]}"; do
+		echo " - ${note}"
+	done
+fi
+
+printf '==> running:'
+for arg in "${cmd[@]}"; do
+	printf ' %q' "${arg}"
+done
+printf '\n'
+
+if [[ ${dry_run} -eq 1 ]]; then
+	exit 0
+fi
+
+(
+	cd "${php_src_dir}"
+	"${cmd[@]}"
+)

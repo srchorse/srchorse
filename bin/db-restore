@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo-root)
+      repo_root="$2"
+      shift 2
+      ;;
+    --help|-h)
+      printf 'Usage: %s [--repo-root PATH]\n' "${0##*/}"
+      exit 0
+      ;;
+    *)
+      printf 'Unknown argument: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+env_path="$repo_root/.env"
+snapshot_path="$repo_root/sql/forensic.sql"
+
+if [[ ! -f "$snapshot_path" ]]; then
+  printf 'Missing SQL snapshot: %s\n' "$snapshot_path" >&2
+  exit 1
+fi
+
+if [[ ! -f "$env_path" ]]; then
+  printf 'Missing .env file: %s\n' "$env_path" >&2
+  exit 1
+fi
+
+eval "$(
+  python3 - "$env_path" <<'PY'
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+import shlex, sys
+
+text = Path(sys.argv[1]).read_text().splitlines()
+url = None
+for line in text:
+    if line.startswith("DATABASE_URL="):
+        url = line.split("=", 1)[1].strip().strip('"').strip("'")
+        break
+if not url:
+    raise SystemExit("missing DATABASE_URL in .env")
+u = urlparse(url)
+if u.scheme != "mysql":
+    raise SystemExit("DATABASE_URL must use mysql://")
+db_name = (u.path or '/').lstrip('/')
+print(f"DB_HOST={shlex.quote(u.hostname or 'localhost')}")
+print(f"DB_PORT={shlex.quote(str(u.port or 3306))}")
+print(f"DB_USER={shlex.quote(unquote(u.username or ''))}")
+print(f"DB_PASSWORD={shlex.quote(unquote(u.password or ''))}")
+print(f"DB_NAME={shlex.quote(db_name)}")
+print(f"DB_NAME_SQL={shlex.quote(db_name.replace('`', '``'))}")
+PY
+)"
+
+MYSQL_PWD="$DB_PASSWORD" mysql \
+  --host="$DB_HOST" \
+  --port="$DB_PORT" \
+  --user="$DB_USER" \
+  -e "DROP DATABASE IF EXISTS \`$DB_NAME_SQL\`; CREATE DATABASE \`$DB_NAME_SQL\`;"
+
+MYSQL_PWD="$DB_PASSWORD" mysql \
+  --binary-mode \
+  --host="$DB_HOST" \
+  --port="$DB_PORT" \
+  --user="$DB_USER" \
+  "$DB_NAME" < "$snapshot_path"

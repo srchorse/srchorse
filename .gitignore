@@ -1,0 +1,58 @@
+/.env
+
+# Source trees are tracked as submodules, not ignored directories.
+!/php-src
+!/php-src-forensic
+
+# Built binaries in repo-root bin/, except tracked helper scripts.
+/bin/*
+!/bin/db-import
+!/bin/db-restore
+!/bin/db-snapshot
+!/bin/php-build
+!/bin/php-configure
+!/bin/source-clone
+!/bin/source-reset
+!/bin/str
+!/bin/tools-build
+/sql/forensic.sql
+
+# Root-level CMake and generated build outputs.
+/CMakeCache.txt
+/CMakeFiles/
+/CMakeScripts/
+/CTestTestfile.cmake
+/_deps/
+/Testing/
+/cmake_install.cmake
+/compile_commands.json
+/install_manifest.txt
+/CMakeUserPresets.json
+
+# Common per-target build outputs under src/.
+/src/**/CMakeCache.txt
+/src/**/CMakeFiles/
+/src/**/CMakeScripts/
+/src/**/CTestTestfile.cmake
+/src/**/_deps/
+/src/**/Testing/
+/src/**/cmake_install.cmake
+/src/**/compile_commands.json
+/src/**/install_manifest.txt
+/src/**/.deps/
+/src/**/.libs/
+/src/**/*.a
+/src/**/*.d
+/src/**/*.dll
+/src/**/*.dylib
+/src/**/*.exe
+/src/**/*.la
+/src/**/*.lo
+/src/**/*.o
+/src/**/*.obj
+/src/**/*.out
+/src/**/*.so
+
+# IDE/local tooling.
+/CMakeLists.txt.user
+/cmake-build-*/

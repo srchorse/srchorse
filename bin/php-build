@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+php_src_dir="$repo_root/php-src"
+
+core_count() {
+  local cpus
+
+  if cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+    printf '%s\n' "$cpus"
+    return 0
+  fi
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpus="$(nproc 2>/dev/null || true)"
+    if [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+      printf '%s\n' "$cpus"
+      return 0
+    fi
+  fi
+
+  printf '1\n'
+}
+
+jobs="$(core_count)"
+
+if [[ ! -d "$php_src_dir" ]]; then
+  printf 'Missing php-src directory: %s\n' "$php_src_dir" >&2
+  exit 1
+fi
+
+printf '==> php-src parallel jobs: %s\n' "$jobs"
+printf '==> php-src distclean\n'
+if [[ -f "$php_src_dir/Makefile" || -f "$php_src_dir/makefile" ]]; then
+  (
+    cd "$php_src_dir"
+    make distclean || true
+  )
+else
+  printf 'Skipping distclean; no existing php-src Makefile\n'
+fi
+
+printf '==> php-src buildconf --force\n'
+(
+  cd "$php_src_dir"
+  ./buildconf --force
+)
+
+printf '==> php-src configure\n'
+"$repo_root/bin/php-configure" "$@"
+
+printf '==> php-src make\n'
+(
+  cd "$php_src_dir"
+  make -j"$jobs"
+)

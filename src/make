@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+src_root="$repo_root/src"
+
+core_count() {
+  local cpus
+
+  if cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+    printf '%s\n' "$cpus"
+    return 0
+  fi
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpus="$(nproc 2>/dev/null || true)"
+    if [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+      printf '%s\n' "$cpus"
+      return 0
+    fi
+  fi
+
+  printf '1\n'
+}
+
+jobs="$(core_count)"
+
+if [[ ! -d "$src_root" ]]; then
+  printf 'Missing src directory: %s\n' "$src_root" >&2
+  exit 1
+fi
+
+found=0
+built=0
+
+for dir in "$src_root"/*; do
+  if [[ ! -d "$dir" ]]; then
+    continue
+  fi
+
+  found=1
+  rel_dir="${dir#$repo_root/}"
+
+  if [[ ! -f "$dir/Makefile" && ! -f "$dir/makefile" ]]; then
+    printf 'Missing Makefile in %s\n' "$rel_dir" >&2
+    exit 1
+  fi
+
+  printf '==> %s (jobs=%s)\n' "$rel_dir" "$jobs"
+  (
+    cd "$dir"
+    make clean
+    make -j"$jobs"
+  )
+  built=1
+done
+
+if [[ "$found" -eq 0 ]]; then
+  printf 'No subdirectories found under %s\n' "$src_root" >&2
+  exit 1
+fi
+
+if [[ "$built" -eq 0 ]]; then
+  printf 'No buildable targets found under %s\n' "$src_root" >&2
+  exit 1
+fi

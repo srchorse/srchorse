@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+target_dir="$repo_root/php-src"
+forensic_dir="$repo_root/php-src-forensic"
+
+if [[ ! -d "$forensic_dir" ]]; then
+  printf 'Missing php-src-forensic directory: %s\n' "$forensic_dir" >&2
+  exit 1
+fi
+
+rm -rf "$target_dir"
+cp -a "$forensic_dir" "$target_dir"

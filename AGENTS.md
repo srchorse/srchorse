@@ -1,0 +1,26 @@
+# src horse Repository Instructions
+
+- A `bin` refers to either a binary under `./bin/*` or a binary built from `./src/*`. Infer which one is meant from context.
+- Always run `./src/make` after making changes to anything under `./src/**/*`.
+- Any time a change is made in this repo, update `AGENTS.md` and update `README.md` if the change affects setup, usage, behavior, or documented workflow.
+- README links must use repo-relative paths or the GitHub repo root, never local filesystem paths like `/home/t/www/ast/...`.
+- Repo-local bin and src build/import tools should default parallel job counts to the detected CPU core count unless explicitly overridden.
+- Primary command surface should use explicit domains:
+- `bin/source-clone`, `bin/source-reset`, `bin/source-dump`
+- `bin/db-import`, `bin/db-restore`, `bin/db-snapshot`, `bin/db-change`, `bin/db-lexeme`
+- `bin/php-configure`, `bin/php-build`, `bin/tools-build`
+- Use `bin/db-change SOURCE TARGET` for direct corpus-wide token rewrites in MySQL; it must preserve `token` references correctly across short and long lexeme storage.
+- `bin/db-change` must report the matched token count, never raw `mysql_affected_rows()` sentinel values from multi-statement flows.
+- `bin/db-change SOURCE TARGET` performs substring replacement inside stored token text across the imported corpus, not exact-token equality only.
+- `bin/db-change` only affects files present in the imported corpus; currently `bin/db-import` tracks `.c` and `.h`, so `.stub.php`-driven generated relationships remain outside its scope.
+- `bin/str` performs recursive filesystem substring replacement and path renames in the current working directory.
+- Use `bin/db-lexeme LEXEME` to query the total token count and distinct source-file count for a lexeme in MySQL.
+- Use `bin/source-dump` to reconstruct the full imported corpus from MySQL back into `./php-src`; it must fail immediately on any unsafe path mapping.
+- `bin/db-import` and `bin/source-dump` must preserve exact source bytes by storing and replaying every source piece in the token stream; do not rely on raw file snapshot columns.
+- `bin/db-import` is the compiled importer command; `bin/db-snapshot` is a separate explicit step and should not be hidden behind `bin/db-import`.
+- `bin/source-clone` must populate both `./php-src` and `./php-src-forensic`.
+- `php-src` and `php-src-forensic` must remain integrated as git submodules, with matching `.gitmodules` entries.
+- `bin/source-reset` must recreate `./php-src` from `./php-src-forensic` and nothing else.
+- `bin/db-import` must import from `./php-src-forensic` by default, while lint/build context stays rooted in `./php-src`.
+- `bin/db-snapshot` must export a full database snapshot to `./sql/forensic.sql`.
+- `bin/db-restore` must restore the database from `./sql/forensic.sql`.

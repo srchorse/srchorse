@@ -1,0 +1,6 @@
+[submodule "php-src"]
+	path = php-src
+	url = https://github.com/php/php-src.git
+[submodule "php-src-forensic"]
+	path = php-src-forensic
+	url = https://github.com/php/php-src.git

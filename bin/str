@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""
+Rename files and replace text in file contents.
+
+Usage: str FIND REPLACE
+Runs in the current working directory, recursively.
+Set STR_IGNORE_DIRS=dir1,dir2 to skip directories.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+DEFAULT_IGNORED_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", ".venv", "venv", "__pycache__"}
+IGNORE_ENV_VAR = "STR_IGNORE_DIRS"
+
+
+def usage(prog: str) -> None:
+    print(f"Usage: {prog} FIND REPLACE", file=sys.stderr)
+
+
+def is_binary(data: bytes) -> bool:
+    return b"\0" in data
+
+
+def get_ignored_dirs() -> set[str]:
+    ignored = set(DEFAULT_IGNORED_DIRS)
+    extra = os.environ.get(IGNORE_ENV_VAR, "")
+    if extra:
+        ignored.update(part.strip() for part in extra.split(",") if part.strip())
+    return ignored
+
+
+def replace_in_file(path: Path, find: str, replace: str, *, quiet_binary: bool = False):
+    data = path.read_bytes()
+    if is_binary(data):
+        if not quiet_binary:
+            print(f"skip binary: {path}", file=sys.stderr)
+        return False, "binary"
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        print(f"skip non-utf8: {path}", file=sys.stderr)
+        return False, "decode"
+
+    if find not in text:
+        return False, None
+
+    path.write_text(text.replace(find, replace), encoding="utf-8")
+    return True, None
+
+
+def collect_renames(root: Path, find: str, replace: str):
+    renames = []
+    ignored_dirs = get_ignored_dirs()
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        base = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if name not in ignored_dirs]
+        for name in list(dirnames) + list(filenames):
+            if find not in name:
+                continue
+            src = base / name
+            dest = base / name.replace(find, replace)
+            if dest == src:
+                continue
+            renames.append((src, dest))
+    return renames
+
+
+def ensure_no_collisions(renames) -> None:
+    dest_seen = {}
+    collisions = []
+    for src, dest in renames:
+        if dest in dest_seen:
+            collisions.append((src, dest, dest_seen[dest]))
+        dest_seen[dest] = src
+
+        if dest.exists() and dest != src:
+            collisions.append((src, dest, "existing"))
+
+    if collisions:
+        print("Aborting: rename collisions detected:", file=sys.stderr)
+        for src, dest, other in collisions:
+            other_display = other if isinstance(other, str) else str(other)
+            print(f"  {src} -> {dest} (conflicts with {other_display})", file=sys.stderr)
+        sys.exit(1)
+
+
+def do_renames(renames):
+    for src, dest in renames:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dest)
+
+
+def replace_contents(root: Path, find: str, replace: str):
+    changed = []
+    ignored_dirs = get_ignored_dirs()
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        base = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if name not in ignored_dirs]
+        for name in filenames:
+            path = base / name
+            updated, _ = replace_in_file(path, find, replace, quiet_binary=True)
+            if updated:
+                changed.append(path)
+    return changed
+
+
+def main(argv):
+    if len(argv) != 3:
+        usage(Path(argv[0]).name)
+        sys.exit(1)
+
+    find, replace = argv[1], argv[2]
+    if find == "":
+        print("FIND must not be empty", file=sys.stderr)
+        sys.exit(1)
+
+    root = Path.cwd()
+    renames = collect_renames(root, find, replace)
+    ensure_no_collisions(renames)
+    do_renames(renames)
+
+    changed_files = replace_contents(root, find, replace)
+
+    print(f"Renamed {len(renames)} path(s); updated {len(changed_files)} file(s).")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+target_dir="$repo_root/php-src"
+forensic_dir="$repo_root/php-src-forensic"
+
+core_count() {
+  local cpus
+
+  if cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+    printf '%s\n' "$cpus"
+    return 0
+  fi
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpus="$(nproc 2>/dev/null || true)"
+    if [[ "$cpus" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
+      printf '%s\n' "$cpus"
+      return 0
+    fi
+  fi
+
+  printf '1\n'
+}
+
+jobs="$(core_count)"
+
+if [[ -e "$target_dir" ]]; then
+  printf 'Target already exists: %s\n' "$target_dir" >&2
+  exit 1
+fi
+
+if [[ -e "$forensic_dir" ]]; then
+  printf 'Target already exists: %s\n' "$forensic_dir" >&2
+  exit 1
+fi
+
+git clone --jobs "$jobs" https://github.com/php/php-src.git "$target_dir"
+cp -a "$target_dir" "$forensic_dir"
