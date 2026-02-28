@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: bin/clone <php|python|nodejs|golang|chromium>" >&2
+}
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+LANG="$1"
+shift
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+require_cmd git
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET_DIR="$ROOT_DIR/src"
+
+if [ -e "$TARGET_DIR" ] && [ -n "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]; then
+  echo "error: $TARGET_DIR already exists and is not empty" >&2
+  exit 1
+fi
+
+case "$LANG" in
+  php)
+    REPO="https://github.com/php/php-src.git"
+    TAG_PATTERN='php-[0-9]+\.[0-9]+\.[0-9]+'
+    ;;
+  python)
+    REPO="https://github.com/python/cpython.git"
+    TAG_PATTERN='v3\.[0-9]+\.[0-9]+'
+    ;;
+  node|nodejs)
+    REPO="https://github.com/nodejs/node.git"
+    TAG_PATTERN='v[0-9]+\.[0-9]+\.[0-9]+'
+    ;;
+  go|golang)
+    REPO="https://github.com/golang/go.git"
+    TAG_PATTERN='go[0-9]+\.[0-9]+(\.[0-9]+)?'
+    ;;
+  chromium)
+    REPO="https://chromium.googlesource.com/chromium/src"
+    TAG_PATTERN='[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+    ;;
+  *)
+    echo "error: unknown language: $LANG" >&2
+    usage
+    exit 1
+    ;;
+ esac
+
+LATEST_TAG="$(
+  git ls-remote --tags --refs "$REPO" |
+    grep -oE "refs/tags/${TAG_PATTERN}$" |
+    awk -F/ '{print $NF}' |
+    sort -V |
+    tail -n 1
+)"
+
+if [ -z "$LATEST_TAG" ]; then
+  echo "error: could not determine latest release tag for $LANG" >&2
+  exit 1
+fi
+
+if [ -d "$TARGET_DIR" ] && [ -z "$(ls -A "$TARGET_DIR" 2>/dev/null)" ]; then
+  rmdir "$TARGET_DIR"
+fi
+
+echo "Cloning $LANG $LATEST_TAG into $TARGET_DIR"
+
+git clone --depth 1 --branch "$LATEST_TAG" "$REPO" "$TARGET_DIR"
+
+echo "Done."

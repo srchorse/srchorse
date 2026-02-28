@@ -1,0 +1,74 @@
+--- a/Zend/zend_operators.c
++++ b/Zend/zend_operators.c
+@@ -408,14 +408,43 @@
+ 	return SUCCESS;
+ }
+ 
++static zend_string *zend_adapt_extract_stdout(zval *decoded)
++{
++	zval *node;
++	zval *result_node;
++
++	if (Z_TYPE_P(decoded) != IS_ARRAY) {
++		return NULL;
++	}
++
++	node = zend_hash_str_find(Z_ARRVAL_P(decoded), ZEND_STRL("stdout"));
++	if (node != NULL) {
++		return zval_get_string(node);
++	}
++
++	result_node = zend_hash_str_find(Z_ARRVAL_P(decoded), ZEND_STRL("result"));
++	if (result_node != NULL && Z_TYPE_P(result_node) == IS_ARRAY) {
++		node = zend_hash_str_find(Z_ARRVAL_P(result_node), ZEND_STRL("stdout"));
++		if (node != NULL) {
++			return zval_get_string(node);
++		}
++	}
++
++	return NULL;
++}
++
+ static void zend_adapt_infer_value(zval *result, zend_string *response)
+ {
+ 	zend_string *trimmed = zend_adapt_trim_response(response);
+-	const char *val = ZSTR_VAL(trimmed);
+-	size_t len = ZSTR_LEN(trimmed);
++	const char *val;
++	size_t len;
+ 	zend_long lval;
+ 	double dval;
+ 
++restart_inference:
++	val = ZSTR_VAL(trimmed);
++	len = ZSTR_LEN(trimmed);
++
+ 	if (len > 0) {
+ 		uint8_t numeric_type = is_numeric_string(val, len, &lval, &dval, 0);
+ 
+@@ -440,6 +469,9 @@
+ 		) {
+ 			zval decoded;
+ 			zval decode_params[2];
++			zend_string *stdout_value = NULL;
++
++			ZVAL_UNDEF(&decoded);
+ 
+ 			ZVAL_STR_COPY(&decode_params[0], trimmed);
+ 			ZVAL_TRUE(&decode_params[1]);
+@@ -447,6 +479,15 @@
+ 			if (zend_adapt_call_named_function(
+ 				ZEND_STRL("json_decode"), &decoded, 2, decode_params
+ 			) == SUCCESS && Z_TYPE(decoded) == IS_ARRAY) {
++				stdout_value = zend_adapt_extract_stdout(&decoded);
++				if (stdout_value != NULL) {
++					zval_ptr_dtor(&decode_params[0]);
++					zval_ptr_dtor(&decoded);
++					zend_string_release_ex(trimmed, 0);
++					trimmed = stdout_value;
++					goto restart_inference;
++				}
++
+ 				ZVAL_COPY_VALUE(result, &decoded);
+ 				zval_ptr_dtor(&decode_params[0]);
+ 				zend_string_release_ex(trimmed, 0);

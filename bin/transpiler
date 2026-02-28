@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: bin/transpiler <codex|copilot|grok|gemini|cursor|claude|q>" >&2
+}
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+PROVIDER="$1"
+shift
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MOD_DIR="$ROOT_DIR/mod"
+PATCH_DIR="$ROOT_DIR/patch"
+OUT_DIR="$ROOT_DIR/transpiler"
+
+if [ ! -d "$MOD_DIR" ]; then
+  echo "error: missing $MOD_DIR (no mods to analyze)" >&2
+  exit 1
+fi
+
+if [ ! -d "$PATCH_DIR" ]; then
+  echo "error: missing $PATCH_DIR (no patches to analyze)" >&2
+  exit 1
+fi
+
+MOD_FILES=("$MOD_DIR"/*.md)
+if [ ! -e "${MOD_FILES[0]}" ]; then
+  echo "error: no mod files found in $MOD_DIR" >&2
+  exit 1
+fi
+
+PATCH_FILES=("$PATCH_DIR"/*.patch)
+if [ ! -e "${PATCH_FILES[0]}" ]; then
+  echo "error: no patch files found in $PATCH_DIR" >&2
+  exit 1
+fi
+
+PROMPT_FILE="$(mktemp)"
+OUTPUT_FILE="$(mktemp)"
+
+{
+  echo "You are generating a Node.js transpiler for the src horse project."
+  echo
+  echo "Requirements:"
+  echo "- Analyze the mods in ./mod and patches in ./patch." 
+  echo "- Create a Node.js transpiler app in ./transpiler." 
+  echo "- The transpiler must accept exactly two flags: --in and --out." 
+  echo "- --in and --out are top-level input and output directories." 
+  echo "- Create the output directory if it does not exist." 
+  echo "- Create an executable binary at ./transpiler/transpile that runs the transpiler with Node.js." 
+  echo
+  echo "Output format (mandatory):"
+  echo "### FILE transpiler/package.json"
+  echo "\`\`\`json"
+  echo "{ ... }"
+  echo "\`\`\`"
+  echo ""
+  echo "### FILE transpiler/src/index.js"
+  echo "\`\`\`js"
+  echo "// transpiler code"
+  echo "\`\`\`"
+  echo ""
+  echo "### FILE transpiler/transpile"
+  echo "\`\`\`bash"
+  echo "#!/usr/bin/env bash"
+  echo "node \"$(dirname \"$0\")/src/index.js\" \"$@\""
+  echo "\`\`\`"
+  echo
+  echo "Mods (each .md file in ./mod):"
+  for f in "${MOD_FILES[@]}"; do
+    echo ""
+    echo "--- MOD FILE: $(basename "$f") ---"
+    cat "$f"
+  done
+  echo ""
+  echo "Patches (each .patch file in ./patch):"
+  for p in "${PATCH_FILES[@]}"; do
+    echo ""
+    echo "--- PATCH FILE: $(basename "$p") ---"
+    cat "$p"
+  done
+} > "$PROMPT_FILE"
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+case "$PROVIDER" in
+  codex)
+    require_cmd codex
+    codex exec --output-last-message "$OUTPUT_FILE" - < "$PROMPT_FILE"
+    ;;
+  gemini)
+    require_cmd gemini
+    gemini -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  claude)
+    require_cmd claude
+    claude -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  grok)
+    require_cmd grok-one-shot
+    grok-one-shot --prompt "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  q)
+    require_cmd q
+    q chat --no-interactive --trust-all-tools "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  copilot)
+    require_cmd gh
+    gh copilot -- --silent -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  cursor)
+    require_cmd cursor
+    echo "error: cursor CLI is for opening files/folders and does not accept prompts." >&2
+    exit 1
+    ;;
+  *)
+    echo "error: unknown provider: $PROVIDER" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+# Write files from the LLM output
+while IFS= read -r line; do
+  if [[ "$line" =~ ^###\ FILE\ (.+)$ ]]; then
+    current_file="${BASH_REMATCH[1]}"
+    in_block=0
+    continue
+  fi
+
+  if [[ "$line" =~ ^``` ]]; then
+    if [ "${in_block:-0}" -eq 0 ]; then
+      if [ -n "${current_file:-}" ]; then
+        mkdir -p "$(dirname "$current_file")"
+        : > "$current_file"
+        in_block=1
+      fi
+    else
+      in_block=0
+      current_file=""
+    fi
+    continue
+  fi
+
+  if [ "${in_block:-0}" -eq 1 ] && [ -n "${current_file:-}" ]; then
+    printf '%s\n' "$line" >> "$current_file"
+  fi
+ done < "$OUTPUT_FILE"
+
+if [ ! -f "$OUT_DIR/package.json" ] || [ ! -f "$OUT_DIR/src/index.js" ]; then
+  echo "error: transpiler output missing required files in $OUT_DIR" >&2
+  exit 1
+fi
+
+# Ensure binary exists and is executable
+if [ ! -f "$OUT_DIR/transpile" ]; then
+  cat <<'WRAP' > "$OUT_DIR/transpile"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+node "$ROOT/src/index.js" "$@"
+WRAP
+fi
+chmod +x "$OUT_DIR/transpile"
+
+# Install dependencies
+( cd "$OUT_DIR" && npm install )
+
+echo "Transpiler generated in $OUT_DIR"

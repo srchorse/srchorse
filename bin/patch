@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_DIR="$ROOT_DIR/src"
+PATCH_DIR="$ROOT_DIR/patch"
+TMP_DIR="$ROOT_DIR/tmp"
+
+if [ ! -d "$SRC_DIR" ]; then
+  echo "error: missing $SRC_DIR (run bin/clone first)" >&2
+  exit 1
+fi
+
+if [ ! -d "$PATCH_DIR" ]; then
+  echo "error: missing $PATCH_DIR (no patches to apply)" >&2
+  exit 1
+fi
+
+# Recreate tmp working tree from src.
+rm -rf "$TMP_DIR"
+cp -a "$SRC_DIR" "$TMP_DIR"
+
+shopt -s nullglob
+PATCH_FILES=("$PATCH_DIR"/*.patch)
+shopt -u nullglob
+
+if [ ${#PATCH_FILES[@]} -eq 0 ]; then
+  echo "error: no patch files found in $PATCH_DIR" >&2
+  exit 1
+fi
+
+# Apply patches in filename order (e.g., 01_*, 02_*).
+IFS=$'\n' sorted=($(printf '%s\n' "${PATCH_FILES[@]}" | sort))
+unset IFS
+
+for patch in "${sorted[@]}"; do
+  name="$(basename "$patch")"
+  if ! echo "$name" | grep -qE '^[0-9]{2}_.+\.patch$'; then
+    echo "error: invalid patch filename: $name (expected 01_name.patch)" >&2
+    exit 1
+  fi
+  echo "Applying $name"
+  strip=1
+  if grep -qE '^diff --git a/src/' "$patch"; then
+    strip=2
+  fi
+  git -C "$TMP_DIR" apply -p"$strip" "$patch"
+ done
+
+echo "Done."

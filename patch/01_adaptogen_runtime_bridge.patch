@@ -1,0 +1,135 @@
+diff --git a/ADAPTOGEN_CAST_SPEC.md b/ADAPTOGEN_CAST_SPEC.md
+new file mode 100644
+index 0000000000..7bc4a9d3fe
+--- /dev/null
++++ b/ADAPTOGEN_CAST_SPEC.md
+@@ -0,0 +1,33 @@
++# Adaptogen Cast Spec (Experimental)
++
++This source-tree mod models the `adaptogen` concept as a language-adjacent runtime bridge.
++The long-term goal is a native PHP cast operator, `(adapt)`, that can consume a class reference
++and execute automation behavior through class-provided static methods.
++
++Headline:
++"Add an Adaptogen cast operator that turns a class reference into a live automation call and inferred value."
++
++Runtime flow expected by the mod:
++1. Accept a class reference target.
++2. Read static `cron()` and `command()` methods from that class.
++3. POST both values to local port `245` using keys `cron` and `command`.
++4. Infer return value type from response body in this fixed order:
++   - integer first, with `0`/`1` coerced to boolean
++   - float
++   - JSON object/array decoded to array-like structure
++   - case-insensitive `true`/`false` strings
++   - plain string fallback
++
++Reasons this can work:
++- The syntax can be concise and memorable, reducing userland glue code.
++- A single local service endpoint can centralize execution policy and cache behavior.
++- Fixed inference order keeps call-site behavior deterministic.
++
++Reasons this can fail:
++- A native cast requires parser/compiler/runtime work and ongoing maintenance.
++- Local HTTP dependency on port `245` can fail operationally.
++- Heuristic inference can misclassify ambiguous outputs without strict conventions.
++
++Implementation note in this tree:
++The accompanying `adaptogen_runtime.py` file provides a Python prototype of the runtime flow so
++behavior can be exercised and tested before any parser-level integration work.
+diff --git a/adaptogen_runtime.py b/adaptogen_runtime.py
+new file mode 100644
+index 0000000000..d4270b3a59
+--- /dev/null
++++ b/adaptogen_runtime.py
+@@ -0,0 +1,90 @@
++"""Prototype runtime for Adaptogen-style class execution.
++
++This module models the requested `(adapt)` behavior as a callable bridge:
++- collect `cron()` and `command()` from a target class
++- POST to local port 245
++- infer result type in a fixed order
++"""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Callable
++from urllib import parse, request
++
++
++def _require_static_callable(target: type[Any], name: str) -> Callable[[], Any]:
++    attr = getattr(target, name, None)
++    if attr is None or not callable(attr):
++        raise TypeError(f"{target.__name__} must define callable static method {name}()")
++    return attr
++
++
++def _collect_payload(target: type[Any]) -> dict[str, str]:
++    cron_fn = _require_static_callable(target, "cron")
++    command_fn = _require_static_callable(target, "command")
++    return {
++        "cron": str(cron_fn()),
++        "command": str(command_fn()),
++    }
++
++
++def _post_local(payload: dict[str, str], timeout: float = 2.0) -> str:
++    data = parse.urlencode(payload).encode("utf-8")
++    http_req = request.Request(
++        "http://127.0.0.1:245/",
++        data=data,
++        headers={"Content-Type": "application/x-www-form-urlencoded"},
++        method="POST",
++    )
++    with request.urlopen(http_req, timeout=timeout) as resp:
++        body = resp.read()
++    return body.decode("utf-8", errors="replace").strip()
++
++
++def _infer_value(raw: str) -> Any:
++    try:
++        as_int = int(raw, 10)
++    except ValueError:
++        pass
++    else:
++        if as_int in (0, 1):
++            return bool(as_int)
++        return as_int
++
++    try:
++        return float(raw)
++    except ValueError:
++        pass
++
++    try:
++        decoded = json.loads(raw)
++    except json.JSONDecodeError:
++        pass
++    else:
++        if isinstance(decoded, (dict, list)):
++            return decoded
++
++    lowered = raw.lower()
++    if lowered == "true":
++        return True
++    if lowered == "false":
++        return False
++
++    return raw
++
++
++def adapt(target: type[Any], timeout: float = 2.0) -> Any:
++    """Execute Adaptogen flow for a class-like target.
++
++    Expected class contract:
++    - static method `cron()`
++    - static method `command()`
++    """
++
++    payload = _collect_payload(target)
++    raw = _post_local(payload, timeout=timeout)
++    return _infer_value(raw)
++
++
++__all__ = ["adapt"]

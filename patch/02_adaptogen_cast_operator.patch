@@ -1,0 +1,517 @@
+diff --git a/Zend/zend_API.c b/Zend/zend_API.c
+index b5c8b7a1..2775538a 100644
+--- a/Zend/zend_API.c
++++ b/Zend/zend_API.c
+@@ -147,6 +147,8 @@ ZEND_API const char *zend_get_type_by_const(int type) /* {{{ */
+ 			return "mixed";
+ 		case _IS_NUMBER:
+ 			return "int|float";
++		case _IS_ADAPT:
++			return "adapt";
+ 		EMPTY_SWITCH_DEFAULT_CASE()
+ 	}
+ }
+diff --git a/Zend/zend_ast.c b/Zend/zend_ast.c
+index 9cb3c7aa..34d6d935 100644
+--- a/Zend/zend_ast.c
++++ b/Zend/zend_ast.c
+@@ -725,16 +725,19 @@ ZEND_API zend_result ZEND_FASTCALL zend_ast_evaluate_inner(
+ 					case IS_STRING:
+ 						ZVAL_STR(result, zval_get_string_func(&op1));
+ 						break;
+-					case IS_ARRAY:
+-						zend_cast_zval_to_array(result, &op1, IS_VAR);
+-						break;
+-					case IS_OBJECT:
+-						zend_cast_zval_to_object(result, &op1, IS_VAR);
+-						break;
+-					EMPTY_SWITCH_DEFAULT_CASE();
+-				}
+-				zval_ptr_dtor_nogc(&op1);
+-				if (UNEXPECTED(EG(exception))) {
++						case IS_ARRAY:
++							zend_cast_zval_to_array(result, &op1, IS_VAR);
++							break;
++						case IS_OBJECT:
++							zend_cast_zval_to_object(result, &op1, IS_VAR);
++							break;
++						case _IS_ADAPT:
++							ret = FAILURE;
++							break;
++						EMPTY_SWITCH_DEFAULT_CASE();
++					}
++					zval_ptr_dtor_nogc(&op1);
++					if (UNEXPECTED(EG(exception))) {
+ 					ret = FAILURE;
+ 				}
+ 			}
+@@ -2317,15 +2320,16 @@ static ZEND_COLD void zend_ast_export_ex(smart_str *str, zend_ast *ast, int prio
+ 		case ZEND_AST_CAST:
+ 			switch (ast->attr) {
+ 				case IS_NULL:      PREFIX_OP("(unset)",  240, 241);
+-				case _IS_BOOL:     PREFIX_OP("(bool)",   240, 241);
+-				case IS_LONG:      PREFIX_OP("(int)",    240, 241);
+-				case IS_DOUBLE:    PREFIX_OP("(float)", 240, 241);
+-				case IS_STRING:    PREFIX_OP("(string)", 240, 241);
+-				case IS_ARRAY:     PREFIX_OP("(array)",  240, 241);
+-				case IS_OBJECT:    PREFIX_OP("(object)", 240, 241);
+-				EMPTY_SWITCH_DEFAULT_CASE();
+-			}
+-			break;
++					case _IS_BOOL:     PREFIX_OP("(bool)",   240, 241);
++					case IS_LONG:      PREFIX_OP("(int)",    240, 241);
++					case IS_DOUBLE:    PREFIX_OP("(float)", 240, 241);
++					case IS_STRING:    PREFIX_OP("(string)", 240, 241);
++					case IS_ARRAY:     PREFIX_OP("(array)",  240, 241);
++					case IS_OBJECT:    PREFIX_OP("(object)", 240, 241);
++					case _IS_ADAPT:    PREFIX_OP("(adapt)",  240, 241);
++					EMPTY_SWITCH_DEFAULT_CASE();
++				}
++				break;
+ 		case ZEND_AST_CAST_VOID:
+ 			PREFIX_OP("(void)", 240, 241);
+ 			break;
+diff --git a/Zend/zend_compile.c b/Zend/zend_compile.c
+index 8be1ee14..415cafa7 100644
+--- a/Zend/zend_compile.c
++++ b/Zend/zend_compile.c
+@@ -12066,13 +12066,15 @@ bool zend_try_ct_eval_cast(zval *result, uint32_t type, zval *op1)
+ 				return true;
+ 			}
+ 			break;
+-		case IS_ARRAY:
+-			ZVAL_COPY(result, op1);
+-			convert_to_array(result);
+-			return true;
++			case IS_ARRAY:
++				ZVAL_COPY(result, op1);
++				convert_to_array(result);
++				return true;
++			case _IS_ADAPT:
++				return false;
++		}
++		return false;
+ 	}
+-	return false;
+-}
+ 
+ static void zend_eval_const_expr(zend_ast **ast_ptr) /* {{{ */
+ {
+diff --git a/Zend/zend_language_parser.y b/Zend/zend_language_parser.y
+index 897abbbe..8e039c60 100644
+--- a/Zend/zend_language_parser.y
++++ b/Zend/zend_language_parser.y
+@@ -78,7 +78,7 @@ static YYSIZE_T zend_yytnamerr(char*, const char*);
+ %left '*' '/' '%'
+ %precedence '!'
+ %precedence T_INSTANCEOF
+-%precedence '~' T_INT_CAST T_DOUBLE_CAST T_STRING_CAST T_ARRAY_CAST T_OBJECT_CAST T_BOOL_CAST T_UNSET_CAST '@'
++%precedence '~' T_INT_CAST T_DOUBLE_CAST T_STRING_CAST T_ARRAY_CAST T_OBJECT_CAST T_BOOL_CAST T_ADAPT_CAST T_UNSET_CAST '@'
+ %right T_POW
+ %precedence T_CLONE
+ 
+@@ -217,6 +217,7 @@ static YYSIZE_T zend_yytnamerr(char*, const char*);
+ %token T_ARRAY_CAST  "'(array)'"
+ %token T_OBJECT_CAST "'(object)'"
+ %token T_BOOL_CAST   "'(bool)'"
++%token T_ADAPT_CAST  "'(adapt)'"
+ %token T_UNSET_CAST  "'(unset)'"
+ %token T_VOID_CAST   "'(void)'"
+ %token T_OBJECT_OPERATOR "'->'"
+@@ -1365,6 +1366,7 @@ expr:
+ 	|	T_ARRAY_CAST expr	{ $$ = zend_ast_create_cast(IS_ARRAY, $2); }
+ 	|	T_OBJECT_CAST expr	{ $$ = zend_ast_create_cast(IS_OBJECT, $2); }
+ 	|	T_BOOL_CAST expr	{ $$ = zend_ast_create_cast(_IS_BOOL, $2); }
++	|	T_ADAPT_CAST expr	{ $$ = zend_ast_create_cast(_IS_ADAPT, $2); }
+ 	|	T_UNSET_CAST expr	{ $$ = zend_ast_create_cast(IS_NULL, $2); }
+ 	|	T_EXIT ctor_arguments {
+ 			zend_ast *name = zend_ast_create_zval_from_str(ZSTR_KNOWN(ZEND_STR_EXIT));
+diff --git a/Zend/zend_language_scanner.l b/Zend/zend_language_scanner.l
+index 3ecb2f8d..c01d1f24 100644
+--- a/Zend/zend_language_scanner.l
++++ b/Zend/zend_language_scanner.l
+@@ -1696,6 +1696,10 @@ OPTIONAL_WHITESPACE_OR_COMMENTS ({WHITESPACE}|{MULTI_LINE_COMMENT}|{SINGLE_LINE_
+ 	RETURN_TOKEN(T_BOOL_CAST);
+ }
+ 
++<ST_IN_SCRIPTING>"("{TABS_AND_SPACES}("adapt"){TABS_AND_SPACES}")" {
++	RETURN_TOKEN(T_ADAPT_CAST);
++}
++
+ <ST_IN_SCRIPTING>"("{TABS_AND_SPACES}("boolean"){TABS_AND_SPACES}")" {
+ 	if (PARSER_MODE()) {
+ 		zend_error(E_DEPRECATED, "Non-canonical cast (boolean) is deprecated, use the (bool) cast instead");
+diff --git a/Zend/zend_operators.c b/Zend/zend_operators.c
+index 36df6915..be109b6d 100644
+--- a/Zend/zend_operators.c
++++ b/Zend/zend_operators.c
+@@ -29,6 +29,7 @@
+ #include "zend_strtod.h"
+ #include "zend_exceptions.h"
+ #include "zend_closures.h"
++#include "zend_smart_str.h"
+ 
+ #include <locale.h>
+ #ifdef HAVE_LANGINFO_H
+@@ -239,6 +240,293 @@ ZEND_API int ZEND_FASTCALL zend_atoi(const char *str, size_t str_len)
+ 
+ /* }}} */
+ 
++static zend_string *zend_adapt_trim_response(const zend_string *raw_response)
++{
++	const unsigned char *start = (const unsigned char *) ZSTR_VAL(raw_response);
++	const unsigned char *end = start + ZSTR_LEN(raw_response);
++
++	while (start < end && isspace(*start)) {
++		start++;
++	}
++	while (end > start && isspace(*(end - 1))) {
++		end--;
++	}
++
++	return zend_string_init((const char *) start, end - start, 0);
++}
++
++static void zend_adapt_append_json_escaped(smart_str *buf, zend_string *value)
++{
++	const unsigned char *ptr = (const unsigned char *) ZSTR_VAL(value);
++	const unsigned char *end = ptr + ZSTR_LEN(value);
++	static const char hex[] = "0123456789abcdef";
++
++	while (ptr < end) {
++		unsigned char c = *ptr++;
++		switch (c) {
++			case '"':
++				smart_str_appendl(buf, "\\\"", 2);
++				break;
++			case '\\':
++				smart_str_appendl(buf, "\\\\", 2);
++				break;
++			case '\b':
++				smart_str_appendl(buf, "\\b", 2);
++				break;
++			case '\f':
++				smart_str_appendl(buf, "\\f", 2);
++				break;
++			case '\n':
++				smart_str_appendl(buf, "\\n", 2);
++				break;
++			case '\r':
++				smart_str_appendl(buf, "\\r", 2);
++				break;
++			case '\t':
++				smart_str_appendl(buf, "\\t", 2);
++				break;
++			default:
++				if (c < 0x20) {
++					char escaped[] = {'\\', 'u', '0', '0', '0', '0'};
++					escaped[4] = hex[c >> 4];
++					escaped[5] = hex[c & 0x0f];
++					smart_str_appendl(buf, escaped, sizeof(escaped));
++				} else {
++					smart_str_appendc(buf, c);
++				}
++				break;
++		}
++	}
++}
++
++static zend_result zend_adapt_call_named_function(
++	const char *function_name, size_t function_name_len, zval *retval, uint32_t param_count, zval params[]
++)
++{
++	zval callable;
++
++	ZVAL_UNDEF(retval);
++	ZVAL_STRINGL(&callable, function_name, function_name_len);
++	if (call_user_function(CG(function_table), NULL, &callable, retval, param_count, params) == FAILURE) {
++		zval_ptr_dtor(&callable);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&callable);
++
++	if (UNEXPECTED(EG(exception) != NULL)) {
++		return FAILURE;
++	}
++
++	return SUCCESS;
++}
++
++static zend_result zend_adapt_call_static_method(zend_string *class_name, const char *method_name, zval *retval)
++{
++	zval callable;
++
++	ZVAL_UNDEF(retval);
++	ZVAL_STR(&callable, zend_strpprintf(0, "%s::%s", ZSTR_VAL(class_name), method_name));
++	if (call_user_function(CG(function_table), NULL, &callable, retval, 0, NULL) == FAILURE) {
++		zval_ptr_dtor(&callable);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&callable);
++
++	if (UNEXPECTED(EG(exception) != NULL)) {
++		return FAILURE;
++	}
++
++	return SUCCESS;
++}
++
++static zend_result zend_adapt_post_request(zend_string *cron, zend_string *command, zend_string **response)
++{
++	smart_str payload = {0};
++	zval stream_options;
++	zval options;
++	zval context;
++	zval context_params[1];
++	zval body_params[3];
++	zval body_result;
++
++	ZVAL_UNDEF(&stream_options);
++	ZVAL_UNDEF(&options);
++	ZVAL_UNDEF(&context);
++	ZVAL_UNDEF(&body_result);
++	*response = NULL;
++
++	smart_str_appendl(&payload, "{\"cron\":\"", sizeof("{\"cron\":\"") - 1);
++	zend_adapt_append_json_escaped(&payload, cron);
++	smart_str_appendl(&payload, "\",\"command\":\"", sizeof("\",\"command\":\"") - 1);
++	zend_adapt_append_json_escaped(&payload, command);
++	smart_str_appendl(&payload, "\"}", 2);
++	smart_str_0(&payload);
++
++	array_init(&stream_options);
++	add_assoc_string(&stream_options, "method", "POST");
++	add_assoc_string(&stream_options, "header", "Content-Type: application/json\r\n");
++	add_assoc_long(&stream_options, "timeout", 2);
++	add_assoc_str(&stream_options, "content", payload.s);
++	payload.s = NULL;
++
++	array_init(&options);
++	add_assoc_zval(&options, "http", &stream_options);
++
++	ZVAL_COPY_VALUE(&context_params[0], &options);
++	if (zend_adapt_call_named_function(
++		ZEND_STRL("stream_context_create"), &context, 1, context_params
++	) == FAILURE) {
++		zval_ptr_dtor(&options);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&options);
++
++	ZVAL_STRING(&body_params[0], "http://127.0.0.1:245/");
++	ZVAL_FALSE(&body_params[1]);
++	ZVAL_COPY(&body_params[2], &context);
++
++	if (zend_adapt_call_named_function(
++		ZEND_STRL("file_get_contents"), &body_result, 3, body_params
++	) == FAILURE) {
++		zval_ptr_dtor(&body_params[0]);
++		zval_ptr_dtor(&body_params[2]);
++		zval_ptr_dtor(&context);
++		return FAILURE;
++	}
++
++	zval_ptr_dtor(&body_params[0]);
++	zval_ptr_dtor(&body_params[2]);
++	zval_ptr_dtor(&context);
++
++	if (Z_TYPE(body_result) == IS_FALSE) {
++		zval_ptr_dtor(&body_result);
++		return FAILURE;
++	}
++
++	*response = zval_get_string(&body_result);
++	zval_ptr_dtor(&body_result);
++	return SUCCESS;
++}
++
++static void zend_adapt_infer_value(zval *result, zend_string *response)
++{
++	zend_string *trimmed = zend_adapt_trim_response(response);
++	const char *val = ZSTR_VAL(trimmed);
++	size_t len = ZSTR_LEN(trimmed);
++	zend_long lval;
++	double dval;
++
++	if (len > 0) {
++		uint8_t numeric_type = is_numeric_string(val, len, &lval, &dval, 0);
++
++		if (numeric_type == IS_LONG) {
++			if (lval == 0 || lval == 1) {
++				ZVAL_BOOL(result, lval == 1);
++			} else {
++				ZVAL_LONG(result, lval);
++			}
++			zend_string_release_ex(trimmed, 0);
++			return;
++		}
++
++		if (numeric_type == IS_DOUBLE) {
++			ZVAL_DOUBLE(result, dval);
++			zend_string_release_ex(trimmed, 0);
++			return;
++		}
++
++		if ((val[0] == '{' || val[0] == '[')
++			&& zend_hash_str_exists(CG(function_table), ZEND_STRL("json_decode"))
++		) {
++			zval decoded;
++			zval decode_params[2];
++
++			ZVAL_STR_COPY(&decode_params[0], trimmed);
++			ZVAL_TRUE(&decode_params[1]);
++
++			if (zend_adapt_call_named_function(
++				ZEND_STRL("json_decode"), &decoded, 2, decode_params
++			) == SUCCESS && Z_TYPE(decoded) == IS_ARRAY) {
++				ZVAL_COPY_VALUE(result, &decoded);
++				zval_ptr_dtor(&decode_params[0]);
++				zend_string_release_ex(trimmed, 0);
++				return;
++			}
++
++			zval_ptr_dtor(&decode_params[0]);
++			if (!Z_ISUNDEF(decoded)) {
++				zval_ptr_dtor(&decoded);
++			}
++		}
++
++		if (zend_string_equals_literal_ci(trimmed, "true")) {
++			ZVAL_TRUE(result);
++			zend_string_release_ex(trimmed, 0);
++			return;
++		}
++
++		if (zend_string_equals_literal_ci(trimmed, "false")) {
++			ZVAL_FALSE(result);
++			zend_string_release_ex(trimmed, 0);
++			return;
++		}
++	}
++
++	ZVAL_STR(result, trimmed);
++}
++
++ZEND_API void ZEND_FASTCALL zend_cast_to_adapt(zval *result, zval *expr)
++{
++	zend_string *class_name = NULL;
++	zend_string *cron = NULL;
++	zend_string *command = NULL;
++	zend_string *response = NULL;
++	zval method_result;
++
++	ZVAL_UNDEF(&method_result);
++
++	if (Z_TYPE_P(expr) == IS_OBJECT) {
++		class_name = zend_string_copy(Z_OBJCE_P(expr)->name);
++	} else {
++		class_name = zval_get_string(expr);
++	}
++
++	if (zend_adapt_call_static_method(class_name, "cron", &method_result) == FAILURE) {
++		zend_error(E_WARNING, "Adapt cast failed while calling %s::cron()", ZSTR_VAL(class_name));
++		zend_string_release_ex(class_name, 0);
++		ZVAL_EMPTY_STRING(result);
++		return;
++	}
++	cron = zval_get_string(&method_result);
++	zval_ptr_dtor(&method_result);
++
++	if (zend_adapt_call_static_method(class_name, "command", &method_result) == FAILURE) {
++		zend_error(E_WARNING, "Adapt cast failed while calling %s::command()", ZSTR_VAL(class_name));
++		zend_string_release_ex(class_name, 0);
++		zend_string_release_ex(cron, 0);
++		ZVAL_EMPTY_STRING(result);
++		return;
++	}
++	command = zval_get_string(&method_result);
++	zval_ptr_dtor(&method_result);
++
++	if (zend_adapt_post_request(cron, command, &response) == FAILURE) {
++		zend_error(E_WARNING, "Adapt cast failed while posting to http://127.0.0.1:245/");
++		zend_string_release_ex(class_name, 0);
++		zend_string_release_ex(cron, 0);
++		zend_string_release_ex(command, 0);
++		ZVAL_EMPTY_STRING(result);
++		return;
++	}
++
++	zend_adapt_infer_value(result, response);
++
++	zend_string_release_ex(class_name, 0);
++	zend_string_release_ex(cron, 0);
++	zend_string_release_ex(command, 0);
++	zend_string_release_ex(response, 0);
++}
++
+ ZEND_API void ZEND_FASTCALL convert_scalar_to_number(zval *op) /* {{{ */
+ {
+ try_again:
+diff --git a/Zend/zend_operators.h b/Zend/zend_operators.h
+index 57bcdd8d..2c47b8eb 100644
+--- a/Zend/zend_operators.h
++++ b/Zend/zend_operators.h
+@@ -321,6 +321,7 @@ ZEND_API void ZEND_FASTCALL convert_to_null(zval *op);
+ ZEND_API void ZEND_FASTCALL convert_to_boolean(zval *op);
+ ZEND_API void ZEND_FASTCALL convert_to_array(zval *op);
+ ZEND_API void ZEND_FASTCALL convert_to_object(zval *op);
++ZEND_API void ZEND_FASTCALL zend_cast_to_adapt(zval *result, zval *expr);
+ 
+ ZEND_API zend_long    ZEND_FASTCALL zval_get_long_func(const zval *op, bool is_strict);
+ ZEND_API zend_long    ZEND_FASTCALL zval_try_get_long(const zval *op, bool *failed);
+diff --git a/Zend/zend_types.h b/Zend/zend_types.h
+index a3d3e4da..ef311feb 100644
+--- a/Zend/zend_types.h
++++ b/Zend/zend_types.h
+@@ -648,6 +648,7 @@ struct _zend_ast_ref {
+ /* used for casts */
+ #define _IS_BOOL					18
+ #define _IS_NUMBER					19
++#define _IS_ADAPT					20
+ 
+ /* guard flags */
+ #define ZEND_GUARD_PROPERTY_GET		(1<<0)
+diff --git a/Zend/zend_vm_def.h b/Zend/zend_vm_def.h
+index 1efd1cb5..8e00447a 100644
+--- a/Zend/zend_vm_def.h
++++ b/Zend/zend_vm_def.h
+@@ -6496,21 +6496,24 @@ ZEND_VM_COLD_CONST_HANDLER(51, ZEND_CAST, CONST|TMP|VAR|CV, ANY, TYPE)
+ 	SAVE_OPLINE();
+ 	expr = GET_OP1_ZVAL_PTR(BP_VAR_R);
+ 
+-	switch (opline->extended_value) {
+-		case IS_LONG:
+-			ZVAL_LONG(result, zval_get_long(expr));
+-			break;
+-		case IS_DOUBLE:
+-			ZVAL_DOUBLE(result, zval_get_double(expr));
+-			break;
+-		case IS_STRING:
+-			ZVAL_STR(result, zval_get_string(expr));
+-			break;
+-		default:
+-			ZEND_ASSERT(opline->extended_value != _IS_BOOL && "Must use ZEND_BOOL instead");
+-			if (OP1_TYPE & (IS_VAR|IS_CV)) {
+-				ZVAL_DEREF(expr);
+-			}
++		switch (opline->extended_value) {
++			case IS_LONG:
++				ZVAL_LONG(result, zval_get_long(expr));
++				break;
++			case IS_DOUBLE:
++				ZVAL_DOUBLE(result, zval_get_double(expr));
++				break;
++			case IS_STRING:
++				ZVAL_STR(result, zval_get_string(expr));
++				break;
++			case _IS_ADAPT:
++				zend_cast_to_adapt(result, expr);
++				break;
++			default:
++				ZEND_ASSERT(opline->extended_value != _IS_BOOL && "Must use ZEND_BOOL instead");
++				if (OP1_TYPE & (IS_VAR|IS_CV)) {
++					ZVAL_DEREF(expr);
++				}
+ 			/* If value is already of correct type, return it directly */
+ 			if (Z_TYPE_P(expr) == opline->extended_value) {
+ 				ZVAL_COPY_VALUE(result, expr);

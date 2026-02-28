@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: bin/generate <codex|copilot|grok|gemini|cursor|claude|q>" >&2
+}
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+PROVIDER="$1"
+shift
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MOD_DIR="$ROOT_DIR/mod"
+PATCH_DIR="$ROOT_DIR/patch"
+
+if [ ! -d "$MOD_DIR" ]; then
+  echo "error: missing $MOD_DIR (no mods to generate patches from)" >&2
+  exit 1
+fi
+
+MOD_FILES=("$MOD_DIR"/*.md)
+if [ ! -e "${MOD_FILES[0]}" ]; then
+  echo "error: no mod files found in $MOD_DIR" >&2
+  exit 1
+fi
+
+PROMPT_FILE="$(mktemp)"
+OUTPUT_FILE="$(mktemp)"
+
+{
+  echo "You are generating a patch set and patches for the src horse project."
+  echo "Definitions:"
+  echo "- 'src' refers to Python source in ./src."
+  echo "- A mod is a modification, stored in ./mod/*.md, and maps to a patch in ./patch/*.patch."
+  echo "- Patches must be applied in order against ./src."
+  echo "- Patch filenames must start with a sequence number like 01_patch_name.patch."
+  echo
+  echo "Task:"
+  echo "1) Create a patch set that covers all mods below."
+  echo "2) For each patch in the set, generate a unified diff that applies cleanly to ./src."
+  echo "3) Use the exact output format below, and nothing else."
+  echo
+  echo "Output format (mandatory):"
+  echo "PATCHSET:"
+  echo "01_patch_name.patch - short summary (mod: mod_file_name.md)"
+  echo "02_another_patch.patch - short summary (mod: mod_file_name.md)"
+  echo ""
+  echo "### PATCH 01_patch_name.patch"
+  echo "\`\`\`patch"
+  echo "diff --git a/... b/..."
+  echo "..."
+  echo "\`\`\`"
+  echo
+  echo "### PATCH 02_another_patch.patch"
+  echo "\`\`\`patch"
+  echo "diff --git a/... b/..."
+  echo "..."
+  echo "\`\`\`"
+  echo
+  echo "Mods (each .md file in ./mod):"
+  for f in "${MOD_FILES[@]}"; do
+    echo ""
+    echo "--- MOD FILE: $(basename "$f") ---"
+    cat "$f"
+  done
+} > "$PROMPT_FILE"
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+case "$PROVIDER" in
+  codex)
+    require_cmd codex
+    codex exec --output-last-message "$OUTPUT_FILE" - < "$PROMPT_FILE"
+    ;;
+  gemini)
+    require_cmd gemini
+    gemini -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  claude)
+    require_cmd claude
+    claude -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  grok)
+    require_cmd grok-one-shot
+    grok-one-shot --prompt "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  q)
+    require_cmd q
+    q chat --no-interactive --trust-all-tools "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  copilot)
+    require_cmd gh
+    gh copilot -- --silent -p "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE"
+    ;;
+  cursor)
+    require_cmd cursor
+    echo "error: cursor CLI is for opening files/folders and does not accept prompts." >&2
+    exit 1
+    ;;
+  *)
+    echo "error: unknown provider: $PROVIDER" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+mkdir -p "$PATCH_DIR"
+
+awk -v patch_dir="$PATCH_DIR" '
+  BEGIN { fname=""; inblock=0; wrote=0 }
+  /^### PATCH / {
+    fname=$3
+    next
+  }
+  /^```patch/ {
+    if (fname != "") {
+      out=patch_dir "/" fname
+      inblock=1
+      wrote=1
+    }
+    next
+  }
+  /^```/ {
+    if (inblock) {
+      inblock=0
+      fname=""
+    }
+    next
+  }
+  {
+    if (inblock && fname != "") {
+      print > out
+    }
+  }
+  END {
+    if (wrote == 0) {
+      exit 2
+    }
+  }
+' "$OUTPUT_FILE"
+
+if [ $? -ne 0 ]; then
+  echo "error: no patch blocks found in LLM output" >&2
+  exit 1
+fi
+
+bad=0
+for p in "$PATCH_DIR"/*.patch; do
+  name="$(basename "$p")"
+  if ! echo "$name" | grep -qE '^[0-9]{2}_.+\.patch$'; then
+    echo "error: invalid patch filename: $name (expected 01_name.patch)" >&2
+    bad=1
+  fi
+  if [ ! -s "$p" ]; then
+    echo "error: empty patch file: $name" >&2
+    bad=1
+  fi
+ done
+
+if [ $bad -ne 0 ]; then
+  exit 1
+fi
+
+echo "Generated patches in $PATCH_DIR"
