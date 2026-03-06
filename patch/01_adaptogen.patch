@@ -1,0 +1,970 @@
+diff --git a/Zend/tests/adaptogen_cast.phpt b/Zend/tests/adaptogen_cast.phpt
+new file mode 100644
+index 00000000..bbbf38a3
+--- /dev/null
++++ b/Zend/tests/adaptogen_cast.phpt
+@@ -0,0 +1,195 @@
++--TEST--
++(adapt) cast supports class strings, autowired new expressions, and distinct keys
++--SKIPIF--
++<?php
++if (!function_exists('proc_open')) {
++    die('skip proc_open is required');
++}
++if (!function_exists('stream_socket_server')) {
++    die('skip stream_socket_server is required');
++}
++$server = @stream_socket_server('tcp://127.0.0.1:245', $errno, $errstr);
++if ($server === false) {
++    die('skip port 245 is unavailable');
++}
++fclose($server);
++?>
++--FILE--
++<?php
++$serverFile = __DIR__ . '/adaptogen_cast_server.php';
++$readyFile = __DIR__ . '/adaptogen_cast_server.ready';
++
++file_put_contents($serverFile, <<<'PHP'
++<?php
++$readyFile = __DIR__ . '/adaptogen_cast_server.ready';
++$server = stream_socket_server('tcp://127.0.0.1:245', $errno, $errstr);
++if ($server === false) {
++    exit(1);
++}
++file_put_contents($readyFile, 'ready');
++
++for ($i = 0; $i < 4; $i++) {
++    $conn = @stream_socket_accept($server, 10);
++    if ($conn === false) {
++        break;
++    }
++
++    $request = '';
++    while (!str_contains($request, "\r\n\r\n")) {
++        $chunk = fread($conn, 8192);
++        if ($chunk === '' || $chunk === false) {
++            break;
++        }
++        $request .= $chunk;
++    }
++
++    [$headers, $body] = explode("\r\n\r\n", $request, 2) + ['', ''];
++    if (preg_match('/Content-Length:\s*(\d+)/i', $headers, $matches)) {
++        $length = (int) $matches[1];
++        while (strlen($body) < $length) {
++            $chunk = fread($conn, $length - strlen($body));
++            if ($chunk === '' || $chunk === false) {
++                break;
++            }
++            $body .= $chunk;
++        }
++    }
++
++    parse_str($body, $post);
++
++    $responseBody = match ($post['command'] ?? '') {
++        'bool-one' => '1',
++        'bool-zero' => '0',
++        default => json_encode($post, JSON_THROW_ON_ERROR),
++    };
++
++    fwrite(
++        $conn,
++        "HTTP/1.1 200 OK\r\n"
++        . "Content-Type: text/plain\r\n"
++        . "Content-Length: " . strlen($responseBody) . "\r\n"
++        . "Connection: close\r\n\r\n"
++        . $responseBody
++    );
++    fclose($conn);
++}
++
++fclose($server);
++@unlink($readyFile);
++PHP);
++
++$descriptors = [
++    0 => ['pipe', 'r'],
++    1 => ['pipe', 'w'],
++    2 => ['pipe', 'w'],
++];
++$process = proc_open([PHP_BINARY, $serverFile], $descriptors, $pipes, __DIR__);
++if (!is_resource($process)) {
++    die("failed to start test server\n");
++}
++
++$started = false;
++for ($i = 0; $i < 50; $i++) {
++    if (file_exists($readyFile)) {
++        $started = true;
++        break;
++    }
++    usleep(100000);
++}
++
++if (!$started) {
++    proc_terminate($process);
++    proc_close($process);
++    die("server did not become ready\n");
++}
++
++final class AdaptogenTrue
++{
++    public function cron(): string
++    {
++        return '* * * * *';
++    }
++
++    public function command(): string
++    {
++        return 'bool-one';
++    }
++}
++
++final class AdaptogenFalse
++{
++    public function cron(): string
++    {
++        return '* * * * *';
++    }
++
++    public function command(): string
++    {
++        return 'bool-zero';
++    }
++}
++
++final class Service1
++{
++    public function getCron(): string
++    {
++        return '*/5 * * * *';
++    }
++}
++
++final class Service2
++{
++    public function getCommand(int $tenantId): string
++    {
++        return '/scripts/adaptogen.sh --tenant=' . $tenantId;
++    }
++}
++
++final class AdaptogenTenant
++{
++    public function __construct(
++        private Service1 $service1,
++        private Service2 $service2,
++        private int $tenantId,
++    ) {
++    }
++
++    public function cron(): string
++    {
++        return $this->service1->getCron();
++    }
++
++    public function command(): string
++    {
++        return $this->service2->getCommand($this->tenantId);
++    }
++
++    public function key(): string
++    {
++        return serialize($this->tenantId);
++    }
++}
++
++try {
++    var_dump((adapt) AdaptogenTrue::class);
++    var_dump((adapt) AdaptogenFalse::class);
++
++    $result1 = (adapt) new AdaptogenTenant(1);
++    $result2 = (adapt) new AdaptogenTenant(2);
++
++    var_dump($result1['cron']);
++    var_dump($result1['command']);
++    var_dump($result1['key'] !== $result2['key']);
++} finally {
++    proc_terminate($process);
++    proc_close($process);
++    @unlink($readyFile);
++    @unlink($serverFile);
++}
++?>
++--EXPECT--
++bool(true)
++bool(false)
++string(11) "*/5 * * * *"
++string(32) "/scripts/adaptogen.sh --tenant=1"
++bool(true)
+diff --git a/Zend/zend_ast.c b/Zend/zend_ast.c
+index 9cb3c7aa..56110527 100644
+--- a/Zend/zend_ast.c
++++ b/Zend/zend_ast.c
+@@ -2323,6 +2323,7 @@ static ZEND_COLD void zend_ast_export_ex(smart_str *str, zend_ast *ast, int prio
+ 				case IS_STRING:    PREFIX_OP("(string)", 240, 241);
+ 				case IS_ARRAY:     PREFIX_OP("(array)",  240, 241);
+ 				case IS_OBJECT:    PREFIX_OP("(object)", 240, 241);
++				case ZEND_CAST_ADAPT: PREFIX_OP("(adapt)", 240, 241);
+ 				EMPTY_SWITCH_DEFAULT_CASE();
+ 			}
+ 			break;
+diff --git a/Zend/zend_ast.h b/Zend/zend_ast.h
+index fb48b187..0a469ad0 100644
+--- a/Zend/zend_ast.h
++++ b/Zend/zend_ast.h
+@@ -236,6 +236,8 @@ typedef struct _zend_ast_fcc {
+ 	ZEND_MAP_PTR_DEF(zend_function *, fptr);
+ } zend_ast_fcc;
+ 
++#define ZEND_CAST_ADAPT 20
++
+ typedef void (*zend_ast_process_t)(zend_ast *ast);
+ extern ZEND_API zend_ast_process_t zend_ast_process;
+ 
+diff --git a/Zend/zend_builtin_functions.c b/Zend/zend_builtin_functions.c
+index 0d8be49a..0562060b 100644
+--- a/Zend/zend_builtin_functions.c
++++ b/Zend/zend_builtin_functions.c
+@@ -17,6 +17,8 @@
++#include <ctype.h>
++
+ #include "zend.h"
+ #include "zend_API.h"
+ #include "zend_attributes.h"
+@@ -69,6 +71,585 @@ zend_result zend_startup_builtin_functions(void) /* {{{ */
+ }
+ /* }}} */
+ 
++static zend_result zend_adapt_call_function(zval *retval, const char *function_name, uint32_t param_count, zval *params) /* {{{ */
++{
++	zval callable;
++	zend_result result;
++
++	ZVAL_STRING(&callable, function_name);
++	result = call_user_function(CG(function_table), NULL, &callable, retval, param_count, params);
++	zval_ptr_dtor(&callable);
++
++	if (UNEXPECTED(result == FAILURE || Z_TYPE_P(retval) == IS_UNDEF || EG(exception))) {
++		return FAILURE;
++	}
++
++	return SUCCESS;
++}
++/* }}} */
++
++static void zend_adapt_trim_string(const zend_string *str, const char **start, size_t *len) /* {{{ */
++{
++	const char *s = ZSTR_VAL(str);
++	size_t l = ZSTR_LEN(str);
++
++	while (l > 0 && isspace((unsigned char) *s)) {
++		s++;
++		l--;
++	}
++	while (l > 0 && isspace((unsigned char) s[l - 1])) {
++		l--;
++	}
++
++	*start = s;
++	*len = l;
++}
++/* }}} */
++
++static zend_result zend_adapt_parse_response(zval *return_value, zend_string *response) /* {{{ */
++{
++	const char *trimmed;
++	size_t trimmed_len;
++	zend_long lval;
++	double dval;
++	zval json_args[2];
++	zval json_result;
++
++	zend_adapt_trim_string(response, &trimmed, &trimmed_len);
++
++	if (trimmed_len != 0) {
++		uint8_t type = is_numeric_string(trimmed, trimmed_len, &lval, &dval, false);
++		if (type == IS_LONG) {
++			if (lval == 0 || lval == 1) {
++				ZVAL_BOOL(return_value, lval == 1);
++			} else {
++				ZVAL_LONG(return_value, lval);
++			}
++			return SUCCESS;
++		}
++		if (type == IS_DOUBLE) {
++			ZVAL_DOUBLE(return_value, dval);
++			return SUCCESS;
++		}
++	}
++
++	ZVAL_STR_COPY(&json_args[0], response);
++	ZVAL_TRUE(&json_args[1]);
++	if (zend_adapt_call_function(&json_result, "json_decode", 2, json_args) == SUCCESS) {
++		if (Z_TYPE(json_result) == IS_ARRAY) {
++			zval_ptr_dtor(&json_args[0]);
++			ZVAL_COPY_VALUE(return_value, &json_result);
++			return SUCCESS;
++		}
++		zval_ptr_dtor(&json_result);
++	}
++	zval_ptr_dtor(&json_args[0]);
++
++	if (trimmed_len == sizeof("true") - 1 && zend_binary_strcasecmp(trimmed, trimmed_len, "true", sizeof("true") - 1) == 0) {
++		ZVAL_TRUE(return_value);
++		return SUCCESS;
++	}
++	if (trimmed_len == sizeof("false") - 1 && zend_binary_strcasecmp(trimmed, trimmed_len, "false", sizeof("false") - 1) == 0) {
++		ZVAL_FALSE(return_value);
++		return SUCCESS;
++	}
++
++	ZVAL_STR_COPY(return_value, response);
++	return SUCCESS;
++}
++/* }}} */
++
++static zend_result zend_adapt_read_http_body(zend_string **body, zend_string *raw_response) /* {{{ */
++{
++	const char *data = ZSTR_VAL(raw_response);
++	const char *separator = zend_memnstr(data, "\r\n\r\n", sizeof("\r\n\r\n") - 1, data + ZSTR_LEN(raw_response));
++
++	if (separator) {
++		separator += sizeof("\r\n\r\n") - 1;
++		*body = zend_string_init(separator, ZSTR_LEN(raw_response) - (separator - data), 0);
++	} else {
++		*body = zend_string_copy(raw_response);
++	}
++
++	return SUCCESS;
++}
++/* }}} */
++
++static zend_result zend_adapt_send_request(zend_string **response_body, zend_string *cron, zend_string *command, zend_string *key) /* {{{ */
++{
++	zval post_fields;
++	zval query_result;
++	zval socket_args[2];
++	zval socket;
++	zval timeout_args[2];
++	smart_str request = {0};
++	zval write_args[2];
++	zval write_result;
++	zval read_args[1];
++	zval raw_response;
++	zval close_args[1];
++	zend_string *body;
++	zend_string *request_string;
++	size_t request_len;
++	zend_long written;
++	zend_result result = FAILURE;
++
++	array_init_size(&post_fields, 3);
++	add_assoc_str(&post_fields, "cron", zend_string_copy(cron));
++	add_assoc_str(&post_fields, "command", zend_string_copy(command));
++	add_assoc_str(&post_fields, "key", zend_string_copy(key));
++
++	if (zend_adapt_call_function(&query_result, "http_build_query", 1, &post_fields) == FAILURE) {
++		zval_ptr_dtor(&post_fields);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&post_fields);
++
++	body = zval_get_string(&query_result);
++	zval_ptr_dtor(&query_result);
++
++	ZVAL_STRINGL(&socket_args[0], "127.0.0.1", sizeof("127.0.0.1") - 1);
++	ZVAL_LONG(&socket_args[1], 245);
++	if (zend_adapt_call_function(&socket, "fsockopen", 2, socket_args) == FAILURE) {
++		zval_ptr_dtor(&socket_args[0]);
++		zend_string_release(body);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&socket_args[0]);
++	if (Z_TYPE(socket) != IS_RESOURCE) {
++		zend_string_release(body);
++		zval_ptr_dtor(&socket);
++		zend_throw_error(NULL, "Unable to connect to the Adaptogen service on port 245");
++		return FAILURE;
++	}
++
++	timeout_args[0] = socket;
++	Z_TRY_ADDREF(timeout_args[0]);
++	ZVAL_LONG(&timeout_args[1], 5);
++	if (zend_adapt_call_function(&write_result, "stream_set_timeout", 2, timeout_args) == SUCCESS) {
++		zval_ptr_dtor(&write_result);
++	}
++	zval_ptr_dtor(&timeout_args[0]);
++
++	smart_str_appends(&request, "POST / HTTP/1.1\r\nHost: 127.0.0.1:245\r\nContent-Type: application/x-www-form-urlencoded\r\nConnection: close\r\nContent-Length: ");
++	smart_str_append_unsigned(&request, ZSTR_LEN(body));
++	smart_str_appends(&request, "\r\n\r\n");
++	smart_str_append(&request, body);
++	smart_str_0(&request);
++	request_string = request.s;
++	request_len = ZSTR_LEN(request_string);
++	zend_string_release(body);
++
++	write_args[0] = socket;
++	Z_TRY_ADDREF(write_args[0]);
++	ZVAL_STR(&write_args[1], request_string);
++	if (zend_adapt_call_function(&write_result, "fwrite", 2, write_args) == FAILURE) {
++		zval_ptr_dtor(&write_args[0]);
++		zval_ptr_dtor(&write_args[1]);
++		goto cleanup_socket;
++	}
++	zval_ptr_dtor(&write_args[0]);
++	zval_ptr_dtor(&write_args[1]);
++
++	written = zval_get_long(&write_result);
++	zval_ptr_dtor(&write_result);
++	if (written < (zend_long) request_len) {
++		zend_throw_error(NULL, "Adaptogen request to port 245 was only partially written");
++		goto cleanup_socket;
++	}
++
++	read_args[0] = socket;
++	Z_TRY_ADDREF(read_args[0]);
++	if (zend_adapt_call_function(&raw_response, "stream_get_contents", 1, read_args) == FAILURE) {
++		zval_ptr_dtor(&read_args[0]);
++		goto cleanup_socket;
++	}
++	zval_ptr_dtor(&read_args[0]);
++
++	if (Z_TYPE(raw_response) != IS_STRING) {
++		zval_ptr_dtor(&raw_response);
++		zend_throw_error(NULL, "Adaptogen service on port 245 returned a non-string response");
++		goto cleanup_socket;
++	}
++
++	result = zend_adapt_read_http_body(response_body, Z_STR(raw_response));
++	zval_ptr_dtor(&raw_response);
++
++cleanup_socket:
++	close_args[0] = socket;
++	Z_TRY_ADDREF(close_args[0]);
++	if (zend_adapt_call_function(&write_result, "fclose", 1, close_args) == SUCCESS) {
++		zval_ptr_dtor(&write_result);
++	}
++	zval_ptr_dtor(&close_args[0]);
++	zval_ptr_dtor(&socket);
++	return result;
++}
++/* }}} */
++
++static zend_result zend_adapt_call_string_method(zend_string **result, zend_object *object, const char *method_name) /* {{{ */
++{
++	zval retval;
++
++	zend_call_method_with_0_params(object, object->ce, NULL, method_name, &retval);
++	if (UNEXPECTED(EG(exception) || Z_TYPE(retval) == IS_UNDEF)) {
++		return FAILURE;
++	}
++
++	*result = zval_get_string(&retval);
++	zval_ptr_dtor(&retval);
++	return SUCCESS;
++}
++/* }}} */
++
++static zend_result zend_adapt_hash_key(zend_string **key, zend_class_entry *ce, zend_string *identity, zend_string *cron, zend_string *command) /* {{{ */
++{
++	smart_str material = {0};
++	zval hash_args[2];
++	zval hash_result;
++	zend_string *hash;
++
++	smart_str_append(&material, ce->name);
++	smart_str_appendc(&material, '\0');
++	smart_str_append(&material, identity);
++	smart_str_appendc(&material, '\0');
++	smart_str_append(&material, cron);
++	smart_str_appendc(&material, '\0');
++	smart_str_append(&material, command);
++	smart_str_0(&material);
++
++	ZVAL_STRINGL(&hash_args[0], "sha256", sizeof("sha256") - 1);
++	ZVAL_STR(&hash_args[1], material.s);
++	if (zend_adapt_call_function(&hash_result, "hash", 2, hash_args) == FAILURE) {
++		zval_ptr_dtor(&hash_args[0]);
++		zval_ptr_dtor(&hash_args[1]);
++		return FAILURE;
++	}
++	zval_ptr_dtor(&hash_args[0]);
++	zval_ptr_dtor(&hash_args[1]);
++
++	hash = zval_get_string(&hash_result);
++	zval_ptr_dtor(&hash_result);
++	*key = zend_strpprintf(0, "adaptogen:%s", ZSTR_VAL(hash));
++	zend_string_release(hash);
++	return SUCCESS;
++}
++/* }}} */
++
++static zend_result zend_adapt_fallback_identity(zend_string **identity, zend_class_entry *ce, HashTable *explicit_args) /* {{{ */
++{
++	if (explicit_args && zend_hash_num_elements(explicit_args) > 0) {
++		zval args;
++		zval serialize_result;
++
++		ZVAL_ARR(&args, explicit_args);
++		Z_TRY_ADDREF(args);
++		if (zend_adapt_call_function(&serialize_result, "serialize", 1, &args) == FAILURE) {
++			zval_ptr_dtor(&args);
++			return FAILURE;
++		}
++		zval_ptr_dtor(&args);
++
++		*identity = zval_get_string(&serialize_result);
++		zval_ptr_dtor(&serialize_result);
++		return SUCCESS;
++	}
++
++	*identity = zend_string_copy(ce->name);
++	return SUCCESS;
++}
++/* }}} */
++
++static zend_class_entry *zend_adapt_resolve_parameter_class(zend_function *function, uint32_t arg_num) /* {{{ */
++{
++	zend_type type = function->common.arg_info[arg_num].type;
++	zend_string *class_name;
++	uint32_t fetch_type;
++	zend_class_entry *ce;
++
++	if (!ZEND_TYPE_IS_SET(type) || ZEND_TYPE_HAS_LIST(type) || !ZEND_TYPE_HAS_NAME(type)) {
++		return NULL;
++	}
++
++	class_name = ZEND_TYPE_NAME(type);
++	fetch_type = zend_get_class_fetch_type(class_name);
++
++	if (fetch_type == ZEND_FETCH_CLASS_DEFAULT) {
++		return zend_lookup_class(class_name);
++	}
++
++	if (!function->common.scope) {
++		return NULL;
++	}
++
++	zend_class_entry *old_scope = EG(fake_scope);
++	EG(fake_scope) = function->common.scope;
++	ce = zend_fetch_class_by_name(class_name, NULL, fetch_type | ZEND_FETCH_CLASS_EXCEPTION);
++	EG(fake_scope) = old_scope;
++
++	return ce;
++}
++/* }}} */
++
++static bool zend_adapt_argument_matches_class(zval *arg, zend_function *function, uint32_t arg_num) /* {{{ */
++{
++	zend_class_entry *ce;
++	zend_type type = function->common.arg_info[arg_num].type;
++
++	if (Z_TYPE_P(arg) == IS_NULL) {
++		return ZEND_TYPE_ALLOW_NULL(type);
++	}
++
++	if (Z_TYPE_P(arg) != IS_OBJECT) {
++		return false;
++	}
++
++	ce = zend_adapt_resolve_parameter_class(function, arg_num);
++	return ce && instanceof_function(Z_OBJCE_P(arg), ce);
++}
++/* }}} */
++
++static zend_result zend_adapt_instantiate(zval *result, zend_class_entry *ce, HashTable *explicit_args, uint32_t depth) /* {{{ */
++{
++	zend_function *constructor;
++	zval *params = NULL;
++	zval **positional_args = NULL;
++	uint32_t positional_count = 0;
++	uint32_t positional_index = 0;
++	uint32_t argc = 0;
++	zend_result status = FAILURE;
++
++	if (UNEXPECTED(depth > 16)) {
++		zend_throw_error(NULL, "Adaptogen dependency graph exceeded the maximum autowiring depth");
++		return FAILURE;
++	}
++
++	if (ce->ce_flags & ZEND_ACC_UNINSTANTIABLE) {
++		zend_throw_error(NULL, "Cannot adapt uninstantiable class %s", ZSTR_VAL(ce->name));
++		return FAILURE;
++	}
++
++	constructor = ce->constructor;
++	if (!constructor) {
++		return object_init_ex(result, ce);
++	}
++
++	if (explicit_args) {
++		uint32_t max_args = zend_hash_num_elements(explicit_args);
++		zval *arg;
++		zend_ulong idx;
++		zend_string *key;
++
++		positional_args = safe_emalloc(max_args ? max_args : 1, sizeof(zval *), 0);
++		ZEND_HASH_FOREACH_KEY_VAL(explicit_args, idx, key, arg) {
++			if (key != NULL) {
++				efree(positional_args);
++				zend_throw_error(NULL, "Named arguments are not supported for the (adapt) cast");
++				return FAILURE;
++			}
++			positional_args[positional_count++] = arg;
++		} ZEND_HASH_FOREACH_END();
++	}
++
++	params = safe_emalloc(constructor->common.num_args ? constructor->common.num_args : 1, sizeof(zval), 0);
++
++	for (uint32_t i = 0; i < constructor->common.num_args; i++) {
++		zend_class_entry *dependency_ce;
++		zval dependency;
++
++		if (ZEND_ARG_IS_VARIADIC(&constructor->common.arg_info[i])) {
++			while (positional_index < positional_count) {
++				ZVAL_COPY(&params[argc++], positional_args[positional_index++]);
++			}
++			break;
++		}
++
++		if (positional_index < positional_count && !zend_adapt_argument_matches_class(positional_args[positional_index], constructor, i)) {
++			dependency_ce = zend_adapt_resolve_parameter_class(constructor, i);
++			if (dependency_ce) {
++				if (zend_adapt_instantiate(&dependency, dependency_ce, NULL, depth + 1) == FAILURE) {
++					goto cleanup;
++				}
++				ZVAL_COPY_VALUE(&params[argc++], &dependency);
++				continue;
++			}
++		}
++
++		if (positional_index < positional_count) {
++			ZVAL_COPY(&params[argc++], positional_args[positional_index++]);
++			continue;
++		}
++
++		dependency_ce = zend_adapt_resolve_parameter_class(constructor, i);
++		if (dependency_ce) {
++			if (zend_adapt_instantiate(&dependency, dependency_ce, NULL, depth + 1) == FAILURE) {
++				goto cleanup;
++			}
++			ZVAL_COPY_VALUE(&params[argc++], &dependency);
++			continue;
++		}
++
++		if (i < constructor->common.required_num_args) {
++			const char *param_name;
++
++			if (constructor->type == ZEND_USER_FUNCTION || (constructor->common.fn_flags & ZEND_ACC_USER_ARG_INFO)) {
++				param_name = ZSTR_VAL(constructor->common.arg_info[i].name);
++			} else {
++				param_name = constructor->internal_function.arg_info[i].name;
++			}
++			zend_throw_error(NULL, "Cannot autowire required constructor parameter $%s for %s",
++				param_name, ZSTR_VAL(ce->name));
++			goto cleanup;
++		}
++
++		break;
++	}
++
++	if (positional_index != positional_count) {
++		zend_throw_error(NULL, "Too many explicit constructor arguments for %s in the (adapt) cast", ZSTR_VAL(ce->name));
++		goto cleanup;
++	}
++
++	status = object_init_with_constructor(result, ce, argc, params, NULL);
++
++cleanup:
++	for (uint32_t i = 0; i < argc; i++) {
++		zval_ptr_dtor(&params[i]);
++	}
++	if (params) {
++		efree(params);
++	}
++	if (positional_args) {
++		efree(positional_args);
++	}
++	return status;
++}
++/* }}} */
++
++static zend_result zend_adapt_resolve_target_object(zval *object, zval *target, HashTable *explicit_args) /* {{{ */
++{
++	switch (Z_TYPE_P(target)) {
++		case IS_STRING: {
++			zend_class_entry *ce = zend_lookup_class(Z_STR_P(target));
++			if (!ce) {
++				zend_throw_error(NULL, "Cannot adapt unknown class %s", ZSTR_VAL(Z_STR_P(target)));
++				return FAILURE;
++			}
++			return zend_adapt_instantiate(object, ce, explicit_args, 0);
++		}
++
++		case IS_OBJECT:
++			ZVAL_OBJ_COPY(object, Z_OBJ_P(target));
++			return SUCCESS;
++
++		default:
++			zend_type_error("The (adapt) cast expects an object or class-string target, %s given",
++				zend_zval_value_name(target));
++			return FAILURE;
++	}
++}
++/* }}} */
++
++static zend_result zend_adapt_get_identity(zend_string **identity, zend_object *object, HashTable *explicit_args) /* {{{ */
++{
++	if (zend_hash_str_exists(&object->ce->function_table, "key", sizeof("key") - 1)) {
++		return zend_adapt_call_string_method(identity, object, "key");
++	}
++
++	return zend_adapt_fallback_identity(identity, object->ce, explicit_args);
++}
++/* }}} */
++
++static zend_result zend_adapt_execute(zval *return_value, zval *target, HashTable *explicit_args) /* {{{ */
++{
++	zval object;
++	zend_string *cron;
++	zend_string *command;
++	zend_string *identity;
++	zend_string *key;
++	zend_string *response;
++	zend_result status = FAILURE;
++
++	if (zend_adapt_resolve_target_object(&object, target, explicit_args) == FAILURE) {
++		return FAILURE;
++	}
++
++	if (zend_adapt_call_string_method(&cron, Z_OBJ(object), "cron") == FAILURE) {
++		goto cleanup_object;
++	}
++
++	if (zend_adapt_call_string_method(&command, Z_OBJ(object), "command") == FAILURE) {
++		zend_string_release(cron);
++		goto cleanup_object;
++	}
++
++	if (zend_adapt_get_identity(&identity, Z_OBJ(object), explicit_args) == FAILURE) {
++		zend_string_release(command);
++		zend_string_release(cron);
++		goto cleanup_object;
++	}
++
++	if (zend_adapt_hash_key(&key, Z_OBJCE(object), identity, cron, command) == FAILURE) {
++		zend_string_release(identity);
++		zend_string_release(command);
++		zend_string_release(cron);
++		goto cleanup_object;
++	}
++
++	if (zend_adapt_send_request(&response, cron, command, key) == FAILURE) {
++		zend_string_release(key);
++		zend_string_release(identity);
++		zend_string_release(command);
++		zend_string_release(cron);
++		goto cleanup_object;
++	}
++
++	status = zend_adapt_parse_response(return_value, response);
++
++	zend_string_release(response);
++	zend_string_release(key);
++	zend_string_release(identity);
++	zend_string_release(command);
++	zend_string_release(cron);
++
++cleanup_object:
++	zval_ptr_dtor(&object);
++	return status;
++}
++/* }}} */
++
++ZEND_FUNCTION(__zend_adapt)
++{
++	zval *target;
++
++	ZEND_PARSE_PARAMETERS_START(1, 1)
++		Z_PARAM_ZVAL(target)
++	ZEND_PARSE_PARAMETERS_END();
++
++	if (zend_adapt_execute(return_value, target, NULL) == FAILURE) {
++		RETURN_THROWS();
++	}
++}
++
++ZEND_FUNCTION(__zend_adapt_new)
++{
++	zend_string *class_name;
++	HashTable *args;
++	zval target;
++
++	ZEND_PARSE_PARAMETERS_START(2, 2)
++		Z_PARAM_STR(class_name)
++		Z_PARAM_ARRAY_HT(args)
++	ZEND_PARSE_PARAMETERS_END();
++
++	ZVAL_STR_COPY(&target, class_name);
++	if (zend_adapt_execute(return_value, &target, args) == FAILURE) {
++		zval_ptr_dtor(&target);
++		RETURN_THROWS();
++	}
++	zval_ptr_dtor(&target);
++}
++
+ ZEND_FUNCTION(clone)
+ {
+ 	zend_object *zobj;
+diff --git a/Zend/zend_builtin_functions_arginfo.h b/Zend/zend_builtin_functions_arginfo.h
+index cf349b551ac21350eb0d93f57561132c3c03242a..7a325c8f8cd1405b70001a1ed5e3cef57e5a0045 100644
+GIT binary patch
+delta 275
+zcmexa{h@xt4CTrHr3`rD<Ev8hQsNU+5(`QuOEc>Tlq43Vr<Uj_cm~J&dPcaqOn%7Y
+zC5EgjJ}<RgN5Mcx!DzA~v)bhM+^myp*md}T+KR!t9D{-!BZ0c4CikgGPPW$I-+VyX
+zp3^$Y)z2l~E!59B#M9qT1KB`LYcAZ9Alo+o(V4*)fucu80cc-lURr)Uib-6Y5R+U{
+Q6hmB$O#|5UF6(?I0HIW3Bme*a
+
+delta 22
+ecmexR|Fe3-4CT%5Rnj>(Ptlvox4GLkl?echFA9GE
+
+diff --git a/Zend/zend_compile.c b/Zend/zend_compile.c
+index 8be1ee14..367ba7de 100644
+--- a/Zend/zend_compile.c
++++ b/Zend/zend_compile.c
+@@ -10455,12 +10455,76 @@ static void zend_compile_pre_incdec(znode *result, zend_ast *ast) /* {{{ */
+ }
+ /* }}} */
+ 
++static zend_ast *zend_compile_adapt_args_array(zend_ast *args_ast) /* {{{ */
++{
++	zend_ast *array_ast = zend_ast_create_list_0(ZEND_AST_ARRAY);
++	zend_ast_list *args = zend_ast_get_list(args_ast);
++
++	for (uint32_t i = 0; i < args->children; i++) {
++		zend_ast *arg_ast = args->child[i];
++		zend_ast *elem_ast = NULL;
++
++		if (arg_ast->kind == ZEND_AST_UNPACK) {
++			zend_error_noreturn(E_COMPILE_ERROR, "Argument unpacking is not supported for the (adapt) cast");
++		}
++
++		if (arg_ast->kind == ZEND_AST_NAMED_ARG) {
++			zend_error_noreturn(E_COMPILE_ERROR, "Named arguments are not supported for the (adapt) cast");
++		} else {
++			elem_ast = zend_ast_create(ZEND_AST_ARRAY_ELEM, arg_ast, NULL);
++		}
++
++		array_ast = zend_ast_list_add(array_ast, elem_ast);
++	}
++
++	return array_ast;
++}
++/* }}} */
++
++static void zend_compile_adapt(znode *result, zend_ast *ast) /* {{{ */
++{
++	zend_ast *expr_ast = ast->child[0];
++	zval fn_name;
++	zend_ast *name_ast;
++	zend_ast *args_ast;
++	zend_ast *call_ast;
++
++	if (expr_ast->kind == ZEND_AST_NEW) {
++		zend_ast *class_ast = expr_ast->child[0];
++
++		if (class_ast->kind == ZEND_AST_CLASS) {
++			zend_error_noreturn(E_COMPILE_ERROR, "Anonymous classes are not supported for the (adapt) cast");
++		}
++
++		ZVAL_STRING(&fn_name, "__zend_adapt_new");
++		name_ast = zend_ast_create_zval(&fn_name);
++		args_ast = zend_ast_create_list(2, ZEND_AST_ARG_LIST,
++			zend_ast_create(ZEND_AST_CLASS_NAME, class_ast),
++			zend_compile_adapt_args_array(expr_ast->child[1]));
++		call_ast = zend_ast_create(ZEND_AST_CALL, name_ast, args_ast);
++	} else {
++		ZVAL_STRING(&fn_name, "__zend_adapt");
++		name_ast = zend_ast_create_zval(&fn_name);
++		args_ast = zend_ast_create_list(1, ZEND_AST_ARG_LIST, expr_ast);
++		call_ast = zend_ast_create(ZEND_AST_CALL, name_ast, args_ast);
++	}
++
++	zend_compile_expr(result, call_ast);
++	zval_ptr_dtor(&fn_name);
++}
++/* }}} */
++
+ static void zend_compile_cast(znode *result, zend_ast *ast) /* {{{ */
+ {
+ 	zend_ast *expr_ast = ast->child[0];
+ 	znode expr_node;
+ 	zend_op *opline;
+ 
++	if (ast->attr == ZEND_CAST_ADAPT) {
++		zend_compile_adapt(result, ast);
++		return;
++	}
++
+ 	zend_compile_expr(&expr_node, expr_ast);
+ 
+ 	if (ast->attr == _IS_BOOL) {
+@@ -11600,6 +11664,10 @@ static void zend_compile_const_expr(zend_ast **ast_ptr, void *context) /* {{{ */
+ 			zend_compile_const_expr_magic_const(ast_ptr);
+ 			break;
+ 		case ZEND_AST_CAST:
++			if (ast->attr == ZEND_CAST_ADAPT) {
++				zend_error_noreturn(E_COMPILE_ERROR,
++					"Adapt casts are not supported in constant expressions");
++			}
+ 			if (ast->attr == IS_OBJECT && !ctx->allow_dynamic) {
+ 				zend_error_noreturn(E_COMPILE_ERROR,
+ 					"Object casts are not supported in this context");
+diff --git a/Zend/zend_language_parser.y b/Zend/zend_language_parser.y
+index 897abbbe..23bf4491 100644
+--- a/Zend/zend_language_parser.y
++++ b/Zend/zend_language_parser.y
+@@ -78,7 +78,7 @@ static YYSIZE_T zend_yytnamerr(char*, const char*);
+ %left '*' '/' '%'
+ %precedence '!'
+ %precedence T_INSTANCEOF
+-%precedence '~' T_INT_CAST T_DOUBLE_CAST T_STRING_CAST T_ARRAY_CAST T_OBJECT_CAST T_BOOL_CAST T_UNSET_CAST '@'
++%precedence '~' T_INT_CAST T_DOUBLE_CAST T_STRING_CAST T_ARRAY_CAST T_OBJECT_CAST T_BOOL_CAST T_UNSET_CAST T_ADAPT_CAST '@'
+ %right T_POW
+ %precedence T_CLONE
+ 
+@@ -219,6 +219,7 @@ static YYSIZE_T zend_yytnamerr(char*, const char*);
+ %token T_BOOL_CAST   "'(bool)'"
+ %token T_UNSET_CAST  "'(unset)'"
+ %token T_VOID_CAST   "'(void)'"
++%token T_ADAPT_CAST  "'(adapt)'"
+ %token T_OBJECT_OPERATOR "'->'"
+ %token T_NULLSAFE_OBJECT_OPERATOR "'?->'"
+ %token T_DOUBLE_ARROW    "'=>'"
+@@ -1366,6 +1367,7 @@ expr:
+ 	|	T_OBJECT_CAST expr	{ $$ = zend_ast_create_cast(IS_OBJECT, $2); }
+ 	|	T_BOOL_CAST expr	{ $$ = zend_ast_create_cast(_IS_BOOL, $2); }
+ 	|	T_UNSET_CAST expr	{ $$ = zend_ast_create_cast(IS_NULL, $2); }
++	|	T_ADAPT_CAST expr	{ $$ = zend_ast_create_cast(ZEND_CAST_ADAPT, $2); }
+ 	|	T_EXIT ctor_arguments {
+ 			zend_ast *name = zend_ast_create_zval_from_str(ZSTR_KNOWN(ZEND_STR_EXIT));
+ 			name->attr = ZEND_NAME_FQ;
+diff --git a/Zend/zend_language_scanner.l b/Zend/zend_language_scanner.l
+index 3ecb2f8d..8291de63 100644
+--- a/Zend/zend_language_scanner.l
++++ b/Zend/zend_language_scanner.l
+@@ -1714,6 +1714,10 @@ OPTIONAL_WHITESPACE_OR_COMMENTS ({WHITESPACE}|{MULTI_LINE_COMMENT}|{SINGLE_LINE_
+ 	RETURN_TOKEN(T_VOID_CAST);
+ }
+ 
++<ST_IN_SCRIPTING>"("{TABS_AND_SPACES}("adapt"){TABS_AND_SPACES}")" {
++	RETURN_TOKEN(T_ADAPT_CAST);
++}
++
+ <ST_IN_SCRIPTING>"eval" {
+ 	RETURN_TOKEN_WITH_IDENT(T_EVAL);
+ }

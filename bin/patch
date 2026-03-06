@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: bin/patch <codex|copilot|grok|gemini|cursor|claude|q>" >&2
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+validate_patch() {
+  local patch_file="$1"
+  local name
+  name="$(basename "$patch_file")"
+
+  if ! echo "$name" | grep -qE '^[0-9]{2}_.+\.patch$'; then
+    echo "error: invalid patch filename: $name (expected 01_name.patch)" >&2
+    return 1
+  fi
+
+  if [ ! -s "$patch_file" ]; then
+    echo "error: empty patch file: $name" >&2
+    return 1
+  fi
+
+  if ! git -C "$SRC_DIR" apply --check --recount -p1 "$patch_file" >/dev/null 2>&1; then
+    echo "error: patch does not apply cleanly: $name" >&2
+    git -C "$SRC_DIR" apply --check --recount -p1 "$patch_file" || true
+    return 1
+  fi
+}
+
+generate_with_codex() {
+  local work_dir patch_tmp_dir summary_file idx patch_name mod_path mod_base prompt_file
+
+  require_cmd codex
+
+  work_dir="$(mktemp -d)"
+  patch_tmp_dir="$(mktemp -d)"
+  summary_file="$(mktemp)"
+  trap "rm -rf '$work_dir' '$patch_tmp_dir'; rm -f '$summary_file'" EXIT
+
+  cp -a "$SRC_DIR"/. "$work_dir"/
+  rm -rf "$work_dir/.git"
+
+  git -C "$work_dir" init -q --initial-branch=srchorse-patch
+  git -C "$work_dir" add -A
+  git -C "$work_dir" -c user.name=srchorse -c user.email=srchorse@example.invalid commit -q -m "baseline"
+
+  idx=1
+  for mod_path in "${MOD_FILES[@]}"; do
+    mod_base="$(basename "$mod_path" .md)"
+    patch_name="$(printf '%02d_%s.patch' "$idx" "$mod_base")"
+    prompt_file="$(mktemp)"
+
+    {
+      echo "You are editing the current working tree, which is upstream language source code for the src horse project."
+      echo
+      echo "Task:"
+      echo "- Implement the behavior described in the mod file below directly in this source tree."
+      echo "- Make production-quality source edits only."
+      echo "- Do not create patch files."
+      echo "- Do not update README.md, AGENTS.md, or markdown docs."
+      echo "- Do not print unified diffs."
+      echo "- Keep changes focused on the runtime/source implementation required by the mod."
+      echo
+      echo "When finished, reply with a short summary only."
+      echo
+      echo "--- MOD FILE: $(basename "$mod_path") ---"
+      cat "$mod_path"
+    } > "$prompt_file"
+
+    codex exec \
+      --cd "$work_dir" \
+      -m gpt-5.4 \
+      -c 'model_reasoning_effort="high"' \
+      --dangerously-bypass-approvals-and-sandbox \
+      --skip-git-repo-check \
+      --output-last-message "$summary_file" \
+      - < "$prompt_file"
+
+    rm -f "$prompt_file"
+
+    git -C "$work_dir" add -A
+    if git -C "$work_dir" diff --cached --quiet; then
+      echo "error: codex produced no source changes for $(basename "$mod_path")" >&2
+      exit 1
+    fi
+
+    git -C "$work_dir" diff --cached --binary --relative > "$patch_tmp_dir/$patch_name"
+    validate_patch "$patch_tmp_dir/$patch_name"
+    git -C "$work_dir" -c user.name=srchorse -c user.email=srchorse@example.invalid commit -q -m "apply $patch_name"
+
+    idx=$((idx + 1))
+  done
+
+  find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
+  cp -a "$patch_tmp_dir"/. "$PATCH_DIR"/
+
+  trap - EXIT
+  rm -rf "$work_dir" "$patch_tmp_dir"
+  rm -f "$summary_file"
+}
+
+generate_with_text_provider() {
+  local prompt_file output_file patch_tmp_dir
+
+  prompt_file="$(mktemp)"
+  output_file="$(mktemp)"
+  patch_tmp_dir="$(mktemp -d)"
+  trap "rm -f '$prompt_file' '$output_file'; rm -rf '$patch_tmp_dir'" EXIT
+
+  {
+    echo "You are generating a patch set and patches for the src horse project."
+    echo "Definitions:"
+    echo "- 'src' refers to the upstream language source in ./src."
+    echo "- A mod is a modification, stored in ./mod/*.md, and maps to a patch in ./patch/*.patch."
+    echo "- Patches must be applied in order against ./src."
+    echo "- Patch filenames must start with a sequence number like 01_patch_name.patch."
+    echo
+    echo "Execution constraints:"
+    echo "- Do not inspect the repository or run tools."
+    echo "- Use only the mod contents included in this prompt."
+    echo "- Output only the mandatory patchset and patch blocks."
+    echo
+    echo "Task:"
+    echo "1) Create a patch set that covers all mods below."
+    echo "2) For each patch in the set, generate a unified diff that applies cleanly to ./src."
+    echo "3) Hunks for the same file must be ordered and non-overlapping."
+    echo "4) Use enough context lines for git apply to accept the patch."
+    echo "5) Use the exact output format below, and nothing else."
+    echo
+    echo "Output format (mandatory):"
+    echo "PATCHSET:"
+    echo "01_patch_name.patch - short summary (mod: mod_file_name.md)"
+    echo "02_another_patch.patch - short summary (mod: mod_file_name.md)"
+    echo
+    echo "### PATCH 01_patch_name.patch"
+    echo "\`\`\`patch"
+    echo "diff --git a/... b/..."
+    echo "..."
+    echo "\`\`\`"
+    echo
+    echo "### PATCH 02_another_patch.patch"
+    echo "\`\`\`patch"
+    echo "diff --git a/... b/..."
+    echo "..."
+    echo "\`\`\`"
+    echo
+    echo "Mods (each .md file in ./mod):"
+    for f in "${MOD_FILES[@]}"; do
+      echo
+      echo "--- MOD FILE: $(basename "$f") ---"
+      cat "$f"
+    done
+  } > "$prompt_file"
+
+  case "$PROVIDER" in
+    gemini)
+      require_cmd gemini
+      gemini -p "$(cat "$prompt_file")" > "$output_file"
+      ;;
+    claude)
+      require_cmd claude
+      claude -p "$(cat "$prompt_file")" > "$output_file"
+      ;;
+    grok)
+      require_cmd grok-one-shot
+      grok-one-shot --prompt "$(cat "$prompt_file")" > "$output_file"
+      ;;
+    q)
+      require_cmd q
+      q chat --no-interactive --trust-all-tools "$(cat "$prompt_file")" > "$output_file"
+      ;;
+    copilot)
+      require_cmd gh
+      gh copilot -- --silent -p "$(cat "$prompt_file")" > "$output_file"
+      ;;
+    cursor)
+      require_cmd cursor
+      echo "error: cursor CLI is for opening files/folders and does not accept prompts." >&2
+      exit 1
+      ;;
+    *)
+      echo "error: unknown provider: $PROVIDER" >&2
+      usage
+      exit 1
+      ;;
+  esac
+
+  awk -v patch_dir="$patch_tmp_dir" '
+    BEGIN { fname=""; inblock=0; wrote=0 }
+    /^### PATCH / {
+      fname=$3
+      next
+    }
+    /^```patch/ {
+      if (fname != "") {
+        out=patch_dir "/" fname
+        inblock=1
+        wrote=1
+      }
+      next
+    }
+    /^```/ {
+      if (inblock) {
+        inblock=0
+        fname=""
+      }
+      next
+    }
+    {
+      if (inblock && fname != "") {
+        print > out
+      }
+    }
+    END {
+      if (wrote == 0) {
+        exit 2
+      }
+    }
+  ' "$output_file"
+
+  if [ $? -ne 0 ]; then
+    echo "error: no patch blocks found in LLM output" >&2
+    exit 1
+  fi
+
+  local bad=0 p
+  for p in "$patch_tmp_dir"/*.patch; do
+    if ! validate_patch "$p"; then
+      bad=1
+    fi
+  done
+
+  if [ "$bad" -ne 0 ]; then
+    exit 1
+  fi
+
+  find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
+  cp -a "$patch_tmp_dir"/. "$PATCH_DIR"/
+
+  trap - EXIT
+  rm -f "$prompt_file" "$output_file"
+  rm -rf "$patch_tmp_dir"
+}
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+PROVIDER="$1"
+shift
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MOD_DIR="$ROOT_DIR/mod"
+PATCH_DIR="$ROOT_DIR/patch"
+SRC_DIR="$ROOT_DIR/src"
+
+if [ ! -d "$MOD_DIR" ]; then
+  echo "error: missing $MOD_DIR (no mods to generate patches from)" >&2
+  exit 1
+fi
+
+if [ ! -d "$SRC_DIR" ]; then
+  echo "error: missing $SRC_DIR (run bin/clone first)" >&2
+  exit 1
+fi
+
+MOD_FILES=("$MOD_DIR"/*.md)
+if [ ! -e "${MOD_FILES[0]}" ]; then
+  echo "error: no mod files found in $MOD_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$PATCH_DIR"
+
+case "$PROVIDER" in
+  codex)
+    generate_with_codex
+    ;;
+  gemini|claude|grok|q|copilot|cursor)
+    generate_with_text_provider
+    ;;
+  *)
+    echo "error: unknown provider: $PROVIDER" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+echo "Generated patches in $PATCH_DIR"

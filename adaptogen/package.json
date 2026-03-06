@@ -1,0 +1,17 @@
+{
+  "name": "adaptogen-cron-runner",
+  "version": "1.0.0",
+  "description": "Dockerized Node.js cron command runner with Redis result caching",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cron": "^4.3.3",
+    "express": "^5.1.0",
+    "redis": "^5.8.2"
+  }
+}
